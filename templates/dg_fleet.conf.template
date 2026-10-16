@@ -1,0 +1,25 @@
+# dg_fleet_check.sh targets - one [section] per database to check.
+# Keep this file mode 600 when it carries passwords.
+# Blank lines and lines starting with # or ; are comments; there are no
+# inline comments, so a password may contain '#'. Values are taken verbatim
+# after trimming surrounding whitespace (no quoting).
+
+# --- over the network, SYS password in this file ------------------------
+[prod.world]                  # section name = TNS alias unless 'tns' is set
+auth = password
+password = ChangeMe
+peer_tns = prod_stby.world    # optional: alias of the peer as THIS host resolves it
+
+# --- over the network, auto-login wallet of THIS host ---------------------
+[prod_stby.world]
+auth = wallet
+
+# --- on the DB host: ssh, then the tool runs there with "/ as sysdba" -------
+[dg2-prod]                    # free label
+auth = ssh
+host = oracle@dg2             # [user@]host; ssh must work non-interactively (keys/agent)
+sid = prod                    # ORACLE_SID on that host
+# oracle_home = /u01/app/oracle/product/19.0.0/dbhome_1   # default: oratab lookup
+# ssh_opts = -p 2222 -i ~/.ssh/dg_key                      # extra ssh options, word-split
+# remote_dir = /home/oracle/dataguard_setup                # run an existing repo copy instead of shipping the tool
+# mode = diag                                              # per-target override of --diag/triage
