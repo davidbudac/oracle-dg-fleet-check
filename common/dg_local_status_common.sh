@@ -33,6 +33,13 @@ SHOW_HELP=false
 
 DG_STATUS_MODE=""
 DG_SCRIPT_NAME=""
+# Two modes: "review" (default, --review-config) grades the running state
+# AND the configuration; "check" (--check) grades only whether Data Guard is
+# running as configured
+# (roles, transport, apply, lag, gaps, broker, observer). Configuration
+# choices (flashback, force logging, standby redo logs, FRA headroom,
+# broker property mismatches) are listed as Info and never change the result.
+DG_SCOPE="review"
 REMOTE_DEFAULT_PROMPT=false
 
 REMOTE_SQL=""
@@ -195,6 +202,46 @@ add_summary_info() {
     SUMMARY_INFOS+=("$message")
 }
 
+dg_check_scope() {
+    [[ "$DG_SCOPE" == "check" ]]
+}
+
+# A configuration finding: graded normally ($1 = error|warning), but under
+# --check it is only listed, so it cannot turn a running setup red/amber.
+add_config_finding() {
+    local severity="$1" message="$2"
+    if dg_check_scope; then
+        add_summary_info "Not graded (--check): ${message}"
+    elif [[ "$severity" == "error" ]]; then
+        add_summary_error "$message"
+    else
+        add_summary_warning "$message"
+    fi
+}
+
+# Broker diagnoses that describe a configuration choice rather than the
+# running state: ORA-16714 / ORA-16792 (property inconsistent with the
+# member setting), ORA-16789 (standby redo logs configured incorrectly),
+# ORA-16827 (Flashback Database disabled).
+dg_broker_config_diagnosis() {
+    printf '%s' "$1" | grep -qE 'ORA-(16714|16789|16792|16827)([^0-9]|$)'
+}
+
+# True when the broker's WARNING comes only from configuration diagnoses:
+# every Warning: line is one of the codes above and nothing is an Error:.
+broker_warnings_all_config() {
+    local line sev found=false
+    while IFS= read -r line; do
+        dg_is_broker_member_line "$line" && continue
+        sev=$(dg_broker_diagnosis_severity "$line")
+        [[ -z "$sev" ]] && continue
+        [[ "$sev" == "error" ]] && return 1
+        dg_broker_config_diagnosis "$line" || return 1
+        found=true
+    done <<< "$DGMGRL_CONFIG"
+    $found
+}
+
 # Infos raised while collecting (before assess_all resets the lists).
 declare -a COLLECT_INFOS=()
 add_collect_info() {
@@ -203,7 +250,7 @@ add_collect_info() {
 
 show_usage() {
     local script_name="$1"
-    printf "Usage: bash %s [-P] [-L] [-t ALIAS [--peer-tns ALIAS]] [--no-color]\n" "$script_name"
+    printf "Usage: bash %s [-P] [-L] [--check|--review-config] [-t ALIAS [--peer-tns ALIAS]] [--no-color]\n" "$script_name"
     printf "  -P, --password   Prompt for SYS password for remote connection\n"
     printf "  -L, --local      Skip remote SQL checks (local + broker only)\n"
     printf "  -t, --tns ALIAS  Run over the network against ALIAS (wallet /@ALIAS, else a SYS\n"
@@ -211,6 +258,11 @@ show_usage() {
     printf "                   needs only an Oracle client (dgmgrl optional)\n"
     printf "  --peer-tns ALIAS Connect identifier for the peer as seen from THIS host (default:\n"
     printf "                   the broker's DGConnectIdentifier, which may only resolve on the DB hosts)\n"
+    printf "  --check          Check mode: only answer \"is Data Guard running as configured?\";\n"
+    printf "                   configuration findings (flashback, force logging, SRLs, FRA headroom)\n"
+    printf "                   are listed, not graded\n"
+    printf "  --review-config  Review-configuration mode (default): grade the running state and the\n"
+    printf "                   configuration\n"
     printf "  --no-color       Disable colored output (also honors NO_COLOR)\n"
     printf "  -h, --help       Show this help\n"
 }
@@ -224,6 +276,7 @@ parse_args() {
     NO_COLOR_FLAG=false
     TARGET_TNS=""
     PEER_TNS_OVERRIDE=""
+    DG_SCOPE="review"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -233,6 +286,14 @@ parse_args() {
                 ;;
             -L|--local)
                 LOCAL_ONLY=true
+                shift
+                ;;
+            --check)
+                DG_SCOPE="check"
+                shift
+                ;;
+            --review-config)
+                DG_SCOPE="review"
                 shift
                 ;;
             -t|--tns)
@@ -1237,13 +1298,13 @@ assess_primary() {
     fi
 
     if [[ -n "${PRI_FORCE:-}" ]] && ! printf '%s' "$PRI_FORCE" | grep -qi "YES"; then
-        PRI_OK=false
-        add_summary_error "Primary force logging is ${PRI_FORCE}"
+        dg_check_scope || PRI_OK=false
+        add_config_finding error "Primary force logging is ${PRI_FORCE}"
     fi
 
     if [[ -n "${PRI_FLASH:-}" ]] && ! printf '%s' "$PRI_FLASH" | grep -qi "YES"; then
         if fsfo_enabled; then
-            add_summary_warning "Primary flashback ${PRI_FLASH} (FSFO needs it)"
+            add_config_finding warning "Primary flashback ${PRI_FLASH} (FSFO needs it)"
         else
             add_summary_info "Primary flashback ${PRI_FLASH} (optional without FSFO)"
         fi
@@ -1279,7 +1340,7 @@ assess_primary() {
     fi
 
     if [[ -n "${PRI_SRL:-}" ]] && [[ "${PRI_SRL:-0}" -le 0 ]]; then
-        add_summary_warning "Primary standby redo log count is ${PRI_SRL:-0}"
+        add_config_finding warning "Primary standby redo log count is ${PRI_SRL:-0}"
     fi
 
     if [[ -n "${PRI_FRA_SIZE:-}" ]]; then
@@ -1289,7 +1350,7 @@ assess_primary() {
             PRI_OK=false
             add_summary_error "Primary FRA usage is ${PRI_FRA_PCT}%"
         elif [[ "$PRI_FRA_PCT" -ge "$DG_FRA_WARN_PCT" ]]; then
-            add_summary_warning "Primary FRA usage is ${PRI_FRA_PCT}%"
+            add_config_finding warning "Primary FRA usage is ${PRI_FRA_PCT}%"
         fi
     else
         PRI_FRA_PCT=0
@@ -1358,8 +1419,8 @@ assess_standby() {
     fi
 
     if [[ -n "${STB_SRL:-}" ]] && [[ "${STB_SRL:-0}" -le 0 ]]; then
-        STB_OK=false
-        add_summary_error "Standby redo log count is ${STB_SRL:-0}"
+        dg_check_scope || STB_OK=false
+        add_config_finding error "Standby redo log count is ${STB_SRL:-0}"
     fi
 
     if [[ -n "${STB_ARCHGAP:-}" ]] && [[ "${STB_ARCHGAP:-0}" -gt 0 ]]; then
@@ -1374,7 +1435,7 @@ assess_standby() {
 
     if [[ -n "${STB_FLASH:-}" ]] && ! printf '%s' "$STB_FLASH" | grep -qi "YES"; then
         if fsfo_enabled; then
-            add_summary_warning "Standby flashback ${STB_FLASH} (FSFO needs it)"
+            add_config_finding warning "Standby flashback ${STB_FLASH} (FSFO needs it)"
         else
             add_summary_info "Standby flashback ${STB_FLASH} (optional without FSFO)"
         fi
@@ -1393,7 +1454,7 @@ assess_standby() {
             STB_OK=false
             add_summary_error "Standby FRA usage is ${STB_FRA_PCT}%"
         elif [[ "$STB_FRA_PCT" -ge "$DG_FRA_WARN_PCT" ]]; then
-            add_summary_warning "Standby FRA usage is ${STB_FRA_PCT}%"
+            add_config_finding warning "Standby FRA usage is ${STB_FRA_PCT}%"
         fi
     else
         STB_FRA_PCT=0
@@ -1413,7 +1474,11 @@ assess_broker() {
         if [[ "$BROKER_OVERALL" == "ERROR" ]]; then
             add_summary_error "Broker overall status is ERROR"
         elif [[ "$BROKER_OVERALL" == "WARNING" ]]; then
-            add_summary_warning "Broker overall status is WARNING"
+            if dg_check_scope && broker_warnings_all_config; then
+                add_summary_info "Not graded (--check): Broker overall status is WARNING (configuration diagnoses only)"
+            else
+                add_summary_warning "Broker overall status is WARNING"
+            fi
         fi
     else
         add_summary_warning "Broker status could not be determined"
@@ -1441,6 +1506,8 @@ assess_broker() {
         diag_text=$(dg_broker_diagnosis_text "$line_trimmed")
         if [[ "$diag_sev" == "error" ]]; then
             add_summary_error "Broker member ${last_member:-configuration}: ${diag_text}"
+        elif dg_broker_config_diagnosis "$diag_text"; then
+            add_config_finding warning "Broker member ${last_member:-configuration}: ${diag_text}"
         else
             add_summary_warning "Broker member ${last_member:-configuration}: ${diag_text}"
         fi
@@ -1634,6 +1701,189 @@ compute_state_labels() {
     [[ "$REPL_STATE" == "PEER_SOURCE" ]] && REPL_STATE="$PEER_SOURCE_STATE"
 }
 
+# -- Components: every broker member and every observer ----------------------
+# CHK_MEMBER_*: one entry per member line of SHOW CONFIGURATION (kind =
+# primary|standby|other, the per-member SHOW DATABASE for standbys).
+# CHK_OBS_*: one entry per observer block of SHOW OBSERVER.
+CHK_MEMBER_NAME=(); CHK_MEMBER_KIND=(); CHK_MEMBER_DISABLED=(); CHK_MEMBER_SHOW=(); CHK_MEMBER_STATUS=()
+CHK_OBS_NAME=(); CHK_OBS_ROLE=(); CHK_OBS_HOST=(); CHK_OBS_PPRI=(); CHK_OBS_PTGT=()
+DGMGRL_OBSERVER=""
+
+collect_components() {
+    local line name type n show
+    CHK_MEMBER_NAME=(); CHK_MEMBER_KIND=(); CHK_MEMBER_DISABLED=(); CHK_MEMBER_SHOW=(); CHK_MEMBER_STATUS=()
+    CHK_OBS_NAME=(); CHK_OBS_ROLE=(); CHK_OBS_HOST=(); CHK_OBS_PPRI=(); CHK_OBS_PTGT=()
+    DGMGRL_OBSERVER=""
+    # Without dgmgrl (network mode, V$DG_BROKER_CONFIG) there is no SHOW
+    # DATABASE / SHOW OBSERVER: the peer view and V$DATABASE stay the source.
+    if [[ -n "$TARGET_TNS" ]] && ! $DGMGRL_AVAILABLE; then
+        return
+    fi
+    $LOCAL_INSTANCE_AVAILABLE || return
+    while IFS= read -r line; do
+        dg_is_broker_member_line "$line" || continue
+        name=$(dg_broker_member_name "$line")
+        type=$(printf '%s' "$line" | sed 's/^[[:space:]]*[^[:space:]]*[[:space:]]*-[[:space:]]*//')
+        n=${#CHK_MEMBER_NAME[@]}
+        CHK_MEMBER_NAME[n]="$name"
+        case "$type" in
+            *[Pp]rimary\ database*) CHK_MEMBER_KIND[n]="primary" ;;
+            *[Ss]tandby\ database*) CHK_MEMBER_KIND[n]="standby" ;;
+            *) CHK_MEMBER_KIND[n]="other" ;;
+        esac
+        case "$type" in *disabled*) CHK_MEMBER_DISABLED[n]=true ;; *) CHK_MEMBER_DISABLED[n]=false ;; esac
+        show=""
+        if [[ "${CHK_MEMBER_KIND[$n]}" == "standby" && "${CHK_MEMBER_DISABLED[$n]}" == false ]]; then
+            if [[ "$name" == "${PEER_DBUNIQ:-}" && -n "${DGMGRL_PEER:-}" ]]; then
+                show="$DGMGRL_PEER"
+            else
+                show=$(run_dgmgrl "SHOW DATABASE '${name}'")
+            fi
+        fi
+        CHK_MEMBER_SHOW[n]="$show"
+        CHK_MEMBER_STATUS[n]=$(printf '%s\n' "$show" | sed -n '/Database Status:/,$p' | extract_first_status)
+    done <<< "$DGMGRL_CONFIG"
+
+    printf '%s\n' "$DGMGRL_FSFO" | grep -qi 'Fast-Start Failover:.*Enabled' || return
+    DGMGRL_OBSERVER=$(run_dgmgrl 'SHOW OBSERVER')
+    parse_observers
+}
+
+# SHOW OBSERVER (19c):
+#   Observer "dg_observer" - Master
+#     Host Name:                    ol9-19-dg3.localdomain
+#     Last Ping to Primary:         2 seconds ago
+#     Last Ping to Target:          2 seconds ago
+parse_observers() {
+    local line t n=-1
+    while IFS= read -r line; do
+        t=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        case "$t" in
+            Observer\ \"*)
+                n=${#CHK_OBS_NAME[@]}
+                CHK_OBS_NAME[n]=$(printf '%s' "$t" | sed 's/^Observer "\([^"]*\)".*/\1/')
+                CHK_OBS_ROLE[n]=$(printf '%s' "$t" | sed -n 's/^Observer "[^"]*"[[:space:]]*-[[:space:]]*//p')
+                CHK_OBS_HOST[n]=""; CHK_OBS_PPRI[n]=""; CHK_OBS_PTGT[n]=""
+                ;;
+            "Host Name:"*)            [[ $n -ge 0 ]] && CHK_OBS_HOST[n]=$(printf '%s' "$t" | sed 's/^Host Name:[[:space:]]*//') ;;
+            "Last Ping to Primary:"*) [[ $n -ge 0 ]] && CHK_OBS_PPRI[n]=$(printf '%s' "$t" | sed 's/^Last Ping to Primary:[[:space:]]*//') ;;
+            "Last Ping to Target:"*)  [[ $n -ge 0 ]] && CHK_OBS_PTGT[n]=$(printf '%s' "$t" | sed 's/^Last Ping to Target:[[:space:]]*//') ;;
+        esac
+    done <<< "$DGMGRL_OBSERVER"
+}
+
+# Seconds since an observer's last ping ("2 seconds ago", "1 minute 5
+# seconds ago"); nothing for "(unknown)" or an empty value.
+observer_ping_age() {
+    local v
+    v=$(dg_broker_lag_value "${1:-}")
+    [[ -n "$v" ]] && dg_parse_lag_seconds "$v"
+}
+
+# A ping is fresh when it is known and not older than the FSFO threshold
+# (DG_OBSERVER_PING_MAX overrides; 30 s when the threshold is unknown):
+# past the threshold the observer has lost that database.
+observer_ping_max() {
+    local t
+    t=$(printf '%s' "${FSFO_THRESHOLD:-}" | sed 's/[^0-9].*//')
+    printf '%s' "${DG_OBSERVER_PING_MAX:-${t:-30}}"
+}
+
+observer_ping_ok() {
+    local age
+    age=$(observer_ping_age "${1:-}")
+    [[ -n "$age" ]] && (( age <= $(observer_ping_max) ))
+}
+
+# OK when observer $1 pings both databases in time; a stale Master is a
+# failure (no automatic failover), a stale Backup only a warning.
+observer_icon() {
+    if observer_ping_ok "${CHK_OBS_PPRI[$1]}" && observer_ping_ok "${CHK_OBS_PTGT[$1]}"; then
+        printf '%b' "$CHK"
+    elif [[ "${CHK_OBS_ROLE[$1]}" == "Master" ]]; then
+        printf '%b' "$FAIL"
+    else
+        printf '%b' "$WARN"
+    fi
+}
+
+check_lag_over() {
+    [[ -n "${1:-}" ]] && (( $(dg_parse_lag_seconds "$1") > DG_LAG_WARN_SECONDS ))
+}
+
+# V$DATABASE.FS_FAILOVER_STATUS with FSFO enabled: ok | warning | error.
+fsfo_status_grade() {
+    case "$(printf '%s' "${1:-}" | tr 'a-z' 'A-Z')" in
+        SYNCHRONIZED|"TARGET UNDER LAG LIMIT"|BYSTANDER) printf 'ok' ;;
+        SUSPENDED|"LOADING DICTIONARY") printf 'warning' ;;
+        "") printf 'warning' ;;
+        UNSYNCHRONIZED|STALLED|"PRIMARY UNOBSERVED"|"TARGET OVER LAG LIMIT"|REINSTATE*|DISABLED) printf 'error' ;;
+        *) printf 'warning' ;;
+    esac
+}
+
+assess_components() {
+    local i name tlag alag sev role age what
+    i=0
+    while [[ $i -lt ${#CHK_MEMBER_NAME[@]} ]]; do
+        name="${CHK_MEMBER_NAME[$i]}"
+        # The local standby is graded from its own V$ views (assess_standby);
+        # member diagnoses already come from SHOW CONFIGURATION (assess_broker).
+        if [[ "${CHK_MEMBER_KIND[$i]}" == "standby" && "${CHK_MEMBER_DISABLED[$i]}" == false && "$name" != "${LOC_DBUNIQ:-}" ]]; then
+            tlag=$(printf '%s\n' "${CHK_MEMBER_SHOW[$i]}" | grep 'Transport Lag:' | sed 's/.*Transport Lag: *//' | dg_trim)
+            alag=$(printf '%s\n' "${CHK_MEMBER_SHOW[$i]}" | grep 'Apply Lag:' | sed 's/.*Apply Lag: *//' | dg_trim)
+            if [[ -z "${CHK_MEMBER_SHOW[$i]}" ]] || ! printf '%s\n' "${CHK_MEMBER_SHOW[$i]}" | grep -q 'Role:'; then
+                add_summary_warning "Standby ${name}: no broker view (SHOW DATABASE returned nothing usable)"
+            else
+                if [[ -z "$(dg_broker_lag_value "$tlag")" ]]; then
+                    add_summary_warning "Standby ${name}: transport lag unknown (${tlag:-no value})"
+                elif check_lag_over "$(dg_broker_lag_value "$tlag")"; then
+                    add_summary_warning "Standby ${name}: transport lag ${tlag%%(*}"
+                fi
+                if [[ -z "$(dg_broker_lag_value "$alag")" ]]; then
+                    add_summary_warning "Standby ${name}: apply lag unknown (${alag:-no value})"
+                elif check_lag_over "$(dg_broker_lag_value "$alag")"; then
+                    add_summary_warning "Standby ${name}: apply lag ${alag%%(*}"
+                fi
+            fi
+        fi
+        i=$((i + 1))
+    done
+
+    fsfo_enabled || return 0
+    sev=$(fsfo_status_grade "${LOC_FSFO_STATUS:-}")
+    if [[ "$sev" == "error" ]]; then
+        add_summary_error "FSFO status on ${LOC_DBUNIQ:-this database} is ${LOC_FSFO_STATUS} (automatic failover is not ready)"
+    elif [[ "$sev" == "warning" ]]; then
+        add_summary_warning "FSFO status on ${LOC_DBUNIQ:-this database} is ${LOC_FSFO_STATUS:-unknown}"
+    fi
+
+    # SHOW OBSERVER unavailable (no dgmgrl): V$DATABASE observer presence,
+    # graded in assess_broker, is all there is.
+    [[ -n "$TARGET_TNS" ]] && ! $DGMGRL_AVAILABLE && return 0
+    if [[ ${#CHK_OBS_NAME[@]} -eq 0 ]]; then
+        add_summary_error "FSFO is enabled but the broker lists no observer"
+        return 0
+    fi
+    local master_seen=false
+    i=0
+    while [[ $i -lt ${#CHK_OBS_NAME[@]} ]]; do
+        role="${CHK_OBS_ROLE[$i]:-?}"
+        [[ "$role" == "Master" ]] && master_seen=true
+        for what in Primary Target; do
+            if [[ "$what" == Primary ]]; then age="${CHK_OBS_PPRI[$i]}"; else age="${CHK_OBS_PTGT[$i]}"; fi
+            observer_ping_ok "$age" && continue
+            if [[ "$role" == "Master" ]]; then
+                add_summary_error "Observer ${CHK_OBS_NAME[$i]} (Master): last ping to the $(printf '%s' "$what" | tr 'A-Z' 'a-z') ${age:-unknown} (limit $(observer_ping_max)s)"
+            else
+                add_summary_warning "Observer ${CHK_OBS_NAME[$i]} (${role}): last ping to the $(printf '%s' "$what" | tr 'A-Z' 'a-z') ${age:-unknown} (limit $(observer_ping_max)s)"
+            fi
+        done
+        i=$((i + 1))
+    done
+    $master_seen || add_summary_error "FSFO is enabled but no Master observer is registered"
+}
+
 assess_all() {
     SUMMARY_ERRORS=()
     SUMMARY_WARNINGS=()
@@ -1648,6 +1898,7 @@ assess_all() {
     assess_primary
     assess_standby
     assess_broker
+    assess_components
     assess_data_source
     compute_state_labels
 }
@@ -1855,6 +2106,19 @@ render_broker_triage() {
         fi
     fi
     [[ -n "${LOC_FSFO_OBSERVER_HOST:-}" ]] && row "Observer Host" "${LOC_FSFO_OBSERVER_HOST}"
+    render_observer_ping_rows
+}
+
+# One row per observer from SHOW OBSERVER: is it still reaching both the
+# primary and the FSFO target?
+render_observer_ping_rows() {
+    local i st
+    i=0
+    while [[ $i -lt ${#CHK_OBS_NAME[@]} ]]; do
+        st=$(observer_icon "$i")
+        row "Observer Pings" "${CHK_OBS_NAME[$i]} (${CHK_OBS_ROLE[$i]:-?}): primary ${CHK_OBS_PPRI[$i]:-unknown}, target ${CHK_OBS_PTGT[$i]:-unknown}" "$st"
+        i=$((i + 1))
+    done
 }
 
 # Severity icon for a missing observer: an error while FSFO is enabled
@@ -2094,6 +2358,7 @@ render_broker_diag() {
         fi
     fi
     [[ -n "${LOC_FSFO_OBSERVER_HOST:-}" ]] && row "Observer Host" "$LOC_FSFO_OBSERVER_HOST"
+    render_observer_ping_rows
 }
 
 render_events_diag() {
@@ -2163,6 +2428,148 @@ render_diag_output() {
     printf "\n"
 }
 
+# --check output: one header line with the verdict, then one line per
+# component (primary, every standby, FSFO, every observer, broker), then the
+# problems - and nothing else. Built to be read for dozens of databases.
+check_host() {
+    printf '%s' "${1%%.*}"
+}
+
+# A lag as plain seconds ("0s", "303s"); "n/a" when there is no value.
+check_lag_text() {
+    if [[ -n "${1:-}" ]]; then
+        printf '%ss' "$(dg_parse_lag_seconds "$1")"
+    else
+        printf 'n/a'
+    fi
+}
+
+render_check_primary_line() {
+    local st
+    if [[ -n "${PRI_ROLE:-}" ]]; then
+        if [[ "$PRI_OK" == true ]]; then st="$CHK"; else st="$FAIL"; fi
+        row "Primary" "${PRI_DBUNIQ:-?}: ${PRI_OPEN:-?}, redo transport ${PRI_DEST2_STATUS:-?}${PRI_DEST2_DBUNIQ:+ -> ${PRI_DEST2_DBUNIQ}}" "$st"
+    else
+        case "$(peer_broker_status)" in
+            SUCCESS) st="$CHK" ;;
+            WARNING) st="$WARN" ;;
+            *) st="$FAIL" ;;
+        esac
+        row "Primary" "${PRI_DBUNIQ:-?}: broker status $(peer_broker_status)" "$st"
+    fi
+}
+
+render_check_standby_lines() {
+    local i name show state tlag alag st detail
+    if [[ ${#CHK_MEMBER_NAME[@]} -eq 0 ]]; then
+        # No broker member list (no dgmgrl): the local/peer view only.
+        if [[ -n "${STB_ROLE:-}" ]]; then
+            if [[ "$STB_OK" == true ]]; then st="$CHK"; else st="$FAIL"; fi
+            row "Standby" "${STB_DBUNIQ:-?}: MRP ${STB_MRP_STATUS:-NOT RUNNING}, transport $(check_lag_text "${STB_TRANSPORT_LAG:-}"), apply $(check_lag_text "${STB_APPLY_LAG:-}")" "$st"
+        else
+            row "Standby" "${STB_DBUNIQ:-?}: $(lag_or_na "${BROKER_TLAG:-}") / $(lag_or_na "${BROKER_ALAG:-}")" "$STANDBY_STATE"
+        fi
+        return
+    fi
+    i=0
+    while [[ $i -lt ${#CHK_MEMBER_NAME[@]} ]]; do
+        name="${CHK_MEMBER_NAME[$i]}"
+        if [[ "${CHK_MEMBER_KIND[$i]}" != "standby" ]]; then
+            i=$((i + 1)); continue
+        fi
+        if [[ "${CHK_MEMBER_DISABLED[$i]}" == true ]]; then
+            row "Standby" "${name}: disabled in the broker"
+        elif [[ "$name" == "${LOC_DBUNIQ:-}" && -n "${STB_ROLE:-}" ]]; then
+            if [[ "$STB_OK" == true ]] && ! check_lag_over "${STB_TRANSPORT_LAG:-}" && ! check_lag_over "${STB_APPLY_LAG:-}"; then st="$CHK"
+            elif [[ "$STB_OK" == true ]]; then st="$WARN"
+            else st="$FAIL"; fi
+            row "Standby" "${name} (local): MRP ${STB_MRP_STATUS:-NOT RUNNING}, transport $(check_lag_text "${STB_TRANSPORT_LAG:-}"), apply $(check_lag_text "${STB_APPLY_LAG:-}")" "$st"
+        else
+            show="${CHK_MEMBER_SHOW[$i]}"
+            state=$(printf '%s\n' "$show" | grep 'Intended State:' | sed 's/.*Intended State: *//' | dg_trim)
+            tlag=$(dg_broker_lag_value "$(printf '%s\n' "$show" | grep 'Transport Lag:' | sed 's/.*Transport Lag: *//')")
+            alag=$(dg_broker_lag_value "$(printf '%s\n' "$show" | grep 'Apply Lag:' | sed 's/.*Apply Lag: *//')")
+            detail="${state:-?}, transport $(check_lag_text "$tlag"), apply $(check_lag_text "$alag")"
+            case "${CHK_MEMBER_STATUS[$i]}" in
+                ERROR|"") st="$FAIL" ;;
+                WARNING) st="$WARN" ;;
+                *) if [[ -z "$tlag" || -z "$alag" ]] || check_lag_over "$tlag" || check_lag_over "$alag"; then st="$WARN"; else st="$CHK"; fi ;;
+            esac
+            [[ "${CHK_MEMBER_STATUS[$i]}" != "SUCCESS" ]] && detail="${detail}, broker ${CHK_MEMBER_STATUS[$i]:-no status}"
+            row "Standby" "${name}: ${detail}" "$st"
+        fi
+        i=$((i + 1))
+    done
+}
+
+render_check_fsfo_lines() {
+    local i st grade
+    if ! fsfo_enabled; then
+        row "FSFO" "${FSFO_MODE:-not configured} (no observer expected)"
+        return
+    fi
+    grade=$(fsfo_status_grade "${LOC_FSFO_STATUS:-}")
+    case "$grade" in ok) st="$CHK" ;; warning) st="$WARN" ;; *) st="$FAIL" ;; esac
+    row "FSFO" "$(printf '%s' "$FSFO_MODE" | sed 's/^Enabled in //; s/ Mode$//'), target ${FSFO_TARGET:-?}, ${LOC_FSFO_STATUS:-status unknown}" "$st"
+    if [[ ${#CHK_OBS_NAME[@]} -eq 0 ]]; then
+        if [[ "${LOC_FSFO_OBSERVER_PRESENT:-}" == "YES" ]]; then st="$CHK"; else st="$FAIL"; fi
+        row "Observer" "$(check_host "${LOC_FSFO_OBSERVER_HOST:-?}"): connected to this database ${LOC_FSFO_OBSERVER_PRESENT:-?} (no SHOW OBSERVER)" "$st"
+        return
+    fi
+    i=0
+    while [[ $i -lt ${#CHK_OBS_NAME[@]} ]]; do
+        st=$(observer_icon "$i")
+        row "Observer" "${CHK_OBS_NAME[$i]} (${CHK_OBS_ROLE[$i]:-?}) @ $(check_host "${CHK_OBS_HOST[$i]:-?}"): last ping primary $(check_ping_text "${CHK_OBS_PPRI[$i]}"), target $(check_ping_text "${CHK_OBS_PTGT[$i]}")" "$st"
+        i=$((i + 1))
+    done
+}
+
+# "2 seconds ago" -> "2s", "1 minute 5 seconds ago" -> "65s", else as is.
+check_ping_text() {
+    local age
+    age=$(observer_ping_age "${1:-}")
+    if [[ -n "$age" ]]; then printf '%ss' "$age"; else printf '%s' "${1:-unknown}"; fi
+}
+
+render_check_output() {
+    local verdict item
+    # Narrow label column: the component lines carry the detail.
+    LABEL_W=8
+    ROW_VALUE_W=$((TERM_WIDTH - LABEL_W - STATUS_W - 6))
+    if ! $LOCAL_INSTANCE_AVAILABLE || [[ $ERRORS -gt 0 ]]; then
+        verdict="${RED}NOT RUNNING CORRECTLY${NC}"
+    elif [[ $WARNINGS -gt 0 ]]; then
+        verdict="${YELLOW}DEGRADED${NC}"
+    else
+        verdict="${GREEN}RUNNING AS CONFIGURED${NC}"
+    fi
+
+    printf "\n ${BOLD}%s${NC} @ %s (%s)  %b  ${DIM}%s${NC}\n" \
+        "${LOC_DBUNIQ:-${TARGET_TNS:-$ORACLE_SID}}" "$(check_host "${LOC_HOST:-$(short_hostname)}")" "${LOC_LABEL}" "$verdict" "$(date '+%Y-%m-%d %H:%M:%S')"
+    if ! $LOCAL_INSTANCE_AVAILABLE; then
+        row "Instance" "${TARGET_TNS:-$ORACLE_SID} - ${LOCAL_INSTANCE_ERROR:-no response from V\$DATABASE}" "$FAIL"
+    else
+        render_check_primary_line
+        render_check_standby_lines
+        render_check_fsfo_lines
+        if [[ "${BROKER_OVERALL:-}" == "SUCCESS" ]]; then
+            row "Broker" "${BROKER_CFG_NAME}: SUCCESS" "$CHK"
+        else
+            row "Broker" "${BROKER_CFG_NAME:-not configured}: ${BROKER_OVERALL:-unknown}" "$BROKER_STATE"
+        fi
+    fi
+    if [[ ${#SUMMARY_ERRORS[@]} -gt 0 ]]; then
+        for item in "${SUMMARY_ERRORS[@]}"; do
+            row "Problem" "$item" "$FAIL"
+        done
+    fi
+    if [[ ${#SUMMARY_WARNINGS[@]} -gt 0 ]]; then
+        for item in "${SUMMARY_WARNINGS[@]}"; do
+            row "Problem" "$item" "$WARN"
+        done
+    fi
+}
+
 collect_all_status_data() {
     COLLECT_INFOS=()
     collect_identity
@@ -2172,8 +2579,10 @@ collect_all_status_data() {
     collect_local_sql
     parse_local_sql
     parse_remote_sql
-    collect_log_matches
+    # --check reports state, not history: no alert/broker log reads.
+    dg_check_scope || collect_log_matches
     assign_role_views
+    collect_components
     assess_all
 }
 
@@ -2217,10 +2626,14 @@ dg_local_status_main() {
     fi
     collect_all_status_data
 
-    case "$mode" in
-        triage) render_triage_output ;;
-        diag) render_diag_output ;;
-    esac
+    if dg_check_scope; then
+        render_check_output
+    else
+        case "$mode" in
+            triage) render_triage_output ;;
+            diag) render_diag_output ;;
+        esac
+    fi
 
     dg_local_status_exit_code
 }

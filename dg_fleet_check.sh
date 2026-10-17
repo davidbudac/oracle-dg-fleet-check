@@ -29,7 +29,14 @@
 #                                    # instead of shipping the tool
 #
 # Optional keys for every target: tns (alias when the section name is a
-# label), peer_tns, mode = triage|diag (overrides --diag for one target).
+# label), peer_tns, mode = triage|diag (overrides --diag for one target),
+# scope = check|review-config (overrides --check/--review-config for one target).
+#
+# Two modes: review-config (default) grades the running state and the
+# configuration; --check answers only "is Data Guard running as configured?": roles,
+# transport, apply, lag, gaps, broker and observer are graded; configuration
+# findings (flashback, force logging, standby redo logs, FRA headroom) are
+# listed but never change the result.
 #
 # Exit code: the worst per-target result - 0 all OK, 1 warnings, 2 at least
 # one CRITICAL or a target that could not be checked; 64 usage/config error.
@@ -44,20 +51,26 @@ SHIP_FILES=(dg_triage_sid.sh dg_diag_sid.sh common/dg_local_status_common.sh com
 
 CONFIG_FILE=""
 GLOBAL_MODE="triage"
+GLOBAL_SCOPE="review-config"
 QUIET=false
-CHECK_ONLY=false
+DRY_RUN=false
 NO_COLOR_FLAG=false
 ONLY_LIST=""
 
 usage() {
     cat <<USAGE
-Usage: $(basename "$0") -c CONFIG [--diag] [--only NAME[,NAME...]] [-q] [-n] [--no-color]
+Usage: $(basename "$0") -c CONFIG [--diag] [--check|--review-config] [--only NAME[,NAME...]] [-q] [-n] [--no-color]
 
   -c, --config FILE  targets file (see the header of this script for the format)
       --diag         run dg_diag_sid.sh instead of dg_triage_sid.sh
+      --check        check mode: only answer "is Data Guard running as configured?";
+                     config findings (flashback, force logging, SRLs, FRA) are not graded
+      --review-config
+                     review-configuration mode (default): grade the running state
+                     and the configuration
       --only NAMES   check only these [targets] (comma separated, repeatable)
   -q, --quiet        print a target's report only when it is not OK
-  -n, --check        parse and validate the config, print the plan, connect nowhere
+  -n, --dry-run      parse and validate the config, print the plan, connect nowhere
       --no-color     disable colored output
   -h, --help         this help
 
@@ -80,12 +93,14 @@ while [[ $# -gt 0 ]]; do
             CONFIG_FILE="$2"; shift 2 ;;
         --config=*) CONFIG_FILE="${1#--config=}"; shift ;;
         --diag) GLOBAL_MODE="diag"; shift ;;
+        --check) GLOBAL_SCOPE="check"; shift ;;
+        --review-config) GLOBAL_SCOPE="review-config"; shift ;;
         --only)
             [[ $# -ge 2 && -n "$2" ]] || die_usage "option $1 requires a target name"
             ONLY_LIST="${ONLY_LIST:+${ONLY_LIST},}$2"; shift 2 ;;
         --only=*) ONLY_LIST="${ONLY_LIST:+${ONLY_LIST},}${1#--only=}"; shift ;;
         -q|--quiet) QUIET=true; shift ;;
-        -n|--check) CHECK_ONLY=true; shift ;;
+        -n|--dry-run) DRY_RUN=true; shift ;;
         --no-color) NO_COLOR_FLAG=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die_usage "unknown option: $1" ;;
@@ -107,7 +122,7 @@ fi
 # Config parsing (Bash 3.2: parallel indexed arrays, no declare -A)
 # ------------------------------------------------------------------
 T_NAME=(); T_AUTH=(); T_TNS=(); T_PASS=(); T_HOST=(); T_SID=(); T_HOME=()
-T_SSHOPTS=(); T_PEER=(); T_RDIR=(); T_MODE=()
+T_SSHOPTS=(); T_PEER=(); T_RDIR=(); T_MODE=(); T_SCOPE=()
 NT=0
 CONFIG_ERRORS=0
 
@@ -125,7 +140,7 @@ trim() {
 
 new_target() {
     T_NAME[NT]="$1"; T_AUTH[NT]=""; T_TNS[NT]=""; T_PASS[NT]=""; T_HOST[NT]=""
-    T_SID[NT]=""; T_HOME[NT]=""; T_SSHOPTS[NT]=""; T_PEER[NT]=""; T_RDIR[NT]=""; T_MODE[NT]=""
+    T_SID[NT]=""; T_HOME[NT]=""; T_SSHOPTS[NT]=""; T_PEER[NT]=""; T_RDIR[NT]=""; T_MODE[NT]=""; T_SCOPE[NT]=""
     NT=$((NT + 1))
 }
 
@@ -178,6 +193,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         peer_tns)    T_PEER[cur]="$val" ;;
         remote_dir)  T_RDIR[cur]="$val" ;;
         mode)        T_MODE[cur]="$(printf '%s' "$val" | tr 'A-Z' 'a-z')" ;;
+        scope)       T_SCOPE[cur]="$(printf '%s' "$val" | tr 'A-Z' 'a-z')" ;;
         *)           cfg_error "$lineno" "unknown key '$key' in [${T_NAME[$cur]}]" ;;
     esac
 done < "$CONFIG_FILE"
@@ -219,6 +235,7 @@ while [[ $i -lt $NT ]]; do
     esac
     case "${T_TNS[$i]}${T_PEER[$i]}" in *\"*) cfg_error 0 "[$n]: a TNS alias cannot contain a double quote" ;; esac
     case "${T_MODE[$i]}" in ''|triage|diag) ;; *) cfg_error 0 "[$n]: mode must be triage or diag" ;; esac
+    case "${T_SCOPE[$i]}" in ''|check|review-config) ;; *) cfg_error 0 "[$n]: scope must be check or review-config" ;; esac
     i=$((i + 1))
 done
 
@@ -299,6 +316,7 @@ build_remote_command() {
 pass_through_flags() {
     local f="--no-color"
     $NO_COLOR_FLAG || [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]] || $QUIET || f=""
+    [[ "$1" == "check" ]] && f="${f:+$f }--check"
     printf '%s' "$f"
 }
 
@@ -306,7 +324,7 @@ run_target() {
     local idx="$1" mode tool flags rc out_file
     mode="${T_MODE[$idx]:-$GLOBAL_MODE}"
     tool="$(tool_for_mode "$mode")"
-    flags="$(pass_through_flags)"
+    flags="$(pass_through_flags "${T_SCOPE[$idx]:-$GLOBAL_SCOPE}")"
     out_file=""
     if $QUIET; then
         out_file="${TMPDIR:-/tmp}/dg_fleet.$$.$idx"
@@ -371,17 +389,20 @@ verdict_of() {
     esac
 }
 
-R_NAME=(); R_METHOD=(); R_VERDICT=(); R_SECS=()
+R_NAME=(); R_METHOD=(); R_VERDICT=(); R_SECS=(); R_RC=()
 WORST=0
 NRUN=0
+ALL_CHECK=true
 
 i=0
 while [[ $i -lt $NT ]]; do
     if ! selected "${T_NAME[$i]}"; then i=$((i + 1)); continue; fi
     mode="${T_MODE[$i]:-$GLOBAL_MODE}"
+    scope="${T_SCOPE[$i]:-$GLOBAL_SCOPE}"
+    [[ "$scope" == "check" ]] && mode="${mode}/check" || ALL_CHECK=false
     label="$(method_label "$i")"
-    if $CHECK_ONLY; then
-        printf '%-24s %-7s %s\n' "${T_NAME[$i]}" "$mode" "$label"
+    if $DRY_RUN; then
+        printf '%-24s %-12s %s\n' "${T_NAME[$i]}" "$mode" "$label"
         i=$((i + 1)); NRUN=$((NRUN + 1))
         continue
     fi
@@ -393,6 +414,7 @@ while [[ $i -lt $NT ]]; do
     R_METHOD[NRUN]="$label"
     R_VERDICT[NRUN]="$(verdict_of "$rc")"
     R_SECS[NRUN]=$((SECONDS - start))
+    R_RC[NRUN]=$rc
     NRUN=$((NRUN + 1))
     case "$rc" in
         0) ;;
@@ -402,7 +424,7 @@ while [[ $i -lt $NT ]]; do
     i=$((i + 1))
 done
 
-if $CHECK_ONLY; then
+if $DRY_RUN; then
     printf '\n%s target(s) would be checked; nothing was connected (-n).\n' "$NRUN"
     exit 0
 fi
@@ -414,4 +436,27 @@ while [[ $i -lt $NRUN ]]; do
     printf '%-24s %-40s %6s  %s\n' "${R_NAME[$i]}" "${R_METHOD[$i]}" "${R_SECS[$i]}" "${R_VERDICT[$i]}"
     i=$((i + 1))
 done
+
+# --check: one plain answer for the whole fleet.
+if $ALL_CHECK && [[ $NRUN -gt 0 ]]; then
+    bad=""; degraded=""
+    i=0
+    while [[ $i -lt $NRUN ]]; do
+        case "${R_RC[$i]}" in
+            0) ;;
+            1) degraded="${degraded:+$degraded, }${R_NAME[$i]}" ;;
+            *) bad="${bad:+$bad, }${R_NAME[$i]}" ;;
+        esac
+        i=$((i + 1))
+    done
+    printf '\n'
+    if [[ -n "$bad" ]]; then
+        printf '%sVERDICT: Data Guard is NOT running correctly%s (problem or not checked: %s)\n' "$C_RED" "$C_NC" "$bad"
+        [[ -n "$degraded" ]] && printf '         degraded: %s\n' "$degraded"
+    elif [[ -n "$degraded" ]]; then
+        printf '%sVERDICT: Data Guard is running but DEGRADED%s (%s)\n' "$C_YELLOW" "$C_NC" "$degraded"
+    else
+        printf '%sVERDICT: Data Guard is running as configured%s (%s target(s))\n' "$C_GREEN" "$C_NC" "$NRUN"
+    fi
+fi
 exit $WORST

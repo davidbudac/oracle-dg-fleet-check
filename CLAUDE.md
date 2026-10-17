@@ -1,6 +1,6 @@
 # Project: dg_fleet_check - Oracle Data Guard health check for a fleet
 
-`dg_fleet_check.sh` runs `dg_triage_sid.sh` / `dg_diag_sid.sh` for every `[target]` of an INI-style config: `auth = password` (`-t ALIAS`, SYS password piped on stdin), `auth = wallet` (`-t ALIAS`), `auth = ssh` (ship the tool as a tar over the ssh stdin into a private temp dir on the DB host, run it there with `ORACLE_SID=sid` and `/ as sysdba`, remove the dir). Whole-config validation before any connection (exit 64), `-q` prints only non-OK reports, exit = worst target (0/1/2; FAILED = tool rc 64, remote setup 70, timeout 124, ssh 255 -> 2).
+`dg_fleet_check.sh` runs `dg_triage_sid.sh` / `dg_diag_sid.sh` for every `[target]` of an INI-style config: `auth = password` (`-t ALIAS`, SYS password piped on stdin), `auth = wallet` (`-t ALIAS`), `auth = ssh` (ship the tool as a tar over the ssh stdin into a private temp dir on the DB host, run it there with `ORACLE_SID=sid` and `/ as sysdba`, remove the dir). Whole-config validation before any connection (exit 64), `-q` prints only non-OK reports, two modes: review configuration (default, `--review-config`) and `--check` (fleet sweep: grades only the running state of every component incl. each standby member and each observer's pings to primary and target; compact one-line-per-component output, no log reads), `-n/--dry-run` validates only, exit = worst target (0/1/2; FAILED = tool rc 64, remote setup 70, timeout 124, ssh 255 -> 2).
 
 Layout (the tool ships exactly these to a DB host - keep `SHIP_FILES` in sync):
 ```

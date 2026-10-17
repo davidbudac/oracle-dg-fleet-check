@@ -111,6 +111,7 @@ sid = cdb1
 # ssh_opts = -p 2222 -i ~/.ssh/dg
 # remote_dir = /home/oracle/dataguard_setup   # existing copy instead of shipping
 # mode = diag                # per-target override
+# scope = check              # per-target mode: check|review-config
 ```
 
 A complete template is in `templates/dg_fleet.conf.template`.
@@ -119,7 +120,8 @@ A complete template is in `templates/dg_fleet.conf.template`.
 bash dg_fleet_check.sh -c fleet.conf             # all targets, full reports + summary
 bash dg_fleet_check.sh -c fleet.conf --diag -q   # deep check, print only the reports that are not OK
 bash dg_fleet_check.sh -c fleet.conf --only cdb1.world,dg2-cdb1
-bash dg_fleet_check.sh -c fleet.conf -n          # validate the config, print the plan, connect nowhere
+bash dg_fleet_check.sh -c fleet.conf -n          # (--dry-run) validate the config, print the plan, connect nowhere
+bash dg_fleet_check.sh -c fleet.conf --check     # check mode: only "is Data Guard running as configured?"
 ```
 
 Rules:
@@ -202,6 +204,55 @@ Compatibility behavior:
 - prints `DEPRECATED: Use dg_triage_sid.sh` to stderr
 - forwards flags unchanged
 - always exits `0`
+
+## Modes: Review Configuration and Check
+
+Both tools and `dg_fleet_check.sh` run in one of two modes:
+
+- **Review configuration** (`--review-config`, the default): everything in
+  "What The Scripts Check" below is graded, configuration choices included.
+- **Check** (`--check`): answers one question, is Data Guard running as it
+  is configured? It is meant for sweeping a whole fleet. The collection is
+  the same except that it skips the alert/broker log reads. The grading and
+  the layout change:
+
+- **Check mode still grades:** roles and open modes, primary switchover status,
+  `dg_broker_start`, archive dest 2 status, archive gaps, UNNAMED datafiles,
+  MRP running, transport / apply / sequence lag, FRA usage at the critical
+  threshold (archiving or apply stops), broker configuration and overall
+  status, broker member errors, every standby member's broker transport /
+  apply lag, the FSFO status and the observers (see "Broker / FSFO checks"),
+  and every "could not determine" warning.
+- **Check mode lists, not grades** (`Info  Not graded (--check): ...`): force logging,
+  Flashback Database (also with FSFO), standby redo log counts, FRA usage at
+  the warning threshold, and broker member *warnings* ORA-16714 / ORA-16792
+  (property inconsistent with the member setting), ORA-16789 (standby redo
+  logs) and ORA-16827 (flashback disabled). A broker overall `WARNING` caused
+  only by those diagnoses is listed too. Any other broker warning still counts.
+- **Check output:** one header line with the verdict (`RUNNING AS
+  CONFIGURED`, `DEGRADED` = warnings only, `NOT RUNNING CORRECTLY` = errors),
+  then one line per component and one `Problem` line per error/warning. No
+  sections, no `Info` lines, no log excerpts; `--diag` makes no difference:
+
+  ```
+   cdb1 @ ol9-19-dg1 (PRIMARY)  RUNNING AS CONFIGURED  2026-10-16 17:49:45
+    Primary  cdb1: READ WRITE, redo transport VALID -> cdb1_stby                 OK
+    Standby  cdb1_stby: APPLY-ON, transport 0s, apply 0s                         OK
+    FSFO     Zero Data Loss, target cdb1_stby, SYNCHRONIZED                      OK
+    Observer dg_observer (Master) @ ol9-19-dg3: last ping primary 3s, target 3s  OK
+    Broker   my_dg_config: SUCCESS                                               OK
+  ```
+
+  Each `Standby` line is one standby member of the broker configuration (the
+  local one from its own V$ views, the others from `SHOW DATABASE`; a
+  disabled member is listed, not graded). Each `Observer` line is one observer
+  from `SHOW OBSERVER`. With FSFO disabled the `FSFO` line says so and no
+  observer is expected.
+- Exit codes are the same in both modes (`0` / `1` / `2`). In the fleet
+  wrapper, `scope = check|review-config` sets the mode per target. When every
+  target ran in check mode, the summary ends with `VERDICT: Data Guard is running as
+  configured`, `... running but DEGRADED (names)` or `... NOT running correctly
+  (names)`.
 
 ## Local Instance Availability
 
@@ -303,6 +354,22 @@ Both commands use the same shared collector and grading rules. The difference is
   FSFO is an optional add-on (step 9) and a manual-failover configuration is
   complete without it. The row reads `Disabled (optional)` with no icon
 - FSFO target
+- Every standby member, not just the peer: the broker's transport / apply lag
+  from `SHOW DATABASE` (above `DG_LAG_WARN_SECONDS` or unknown = warning). The
+  local standby is graded from its own V$ views instead. A disabled member is
+  skipped.
+- FSFO status (`V$DATABASE.FS_FAILOVER_STATUS`, FSFO enabled only):
+  `SYNCHRONIZED`, `TARGET UNDER LAG LIMIT` and `BYSTANDER` are fine;
+  `UNSYNCHRONIZED`, `STALLED`, `PRIMARY UNOBSERVED`, `TARGET OVER LAG LIMIT`,
+  `REINSTATE ...` and `DISABLED` are errors (automatic failover is not
+  ready); `SUSPENDED`, `LOADING DICTIONARY` and anything else are warnings.
+- Observers actually monitoring (FSFO enabled, dgmgrl available): `SHOW
+  OBSERVER` lists each observer's `Last Ping to Primary` and `Last Ping to
+  Target`. Both must be known and no older than the FSFO threshold
+  (`DG_OBSERVER_PING_MAX` overrides it; 30 s when unknown). A stale Master is
+  an error, a stale Backup a warning. No observer listed, or no Master, is an
+  error. The `Observer Pings` row shows this in both modes. Without dgmgrl
+  (network mode on an Instant Client) only the presence below is checked.
 - Observer presence / host. `V$DATABASE.FS_FAILOVER_OBSERVER_PRESENT` is the
   authority on whether an observer is actually connected. **FSFO enabled with
   no observer present is an error** (automatic failover will not happen) -- the

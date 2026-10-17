@@ -25,6 +25,12 @@
 #     oratab miss -> rc 70 FAILED
 #   - result aggregation: exit = worst of 0/1/2, FAILED for 64/70/255, -q
 #     prints only non-OK reports, summary table
+#   - --check / --review-config / scope: flag passed to the tool, per-target override, the
+#     fleet VERDICT line; the engine's check-mode grading (config findings
+#     listed as Info, running-state findings still graded)
+#   - engine components: every standby member's broker lag, FSFO status,
+#     observer pings to primary and target (Master stale = error, Backup
+#     stale = warning, no observer = error), the compact --check output
 # ============================================================
 
 PASS=0
@@ -151,9 +157,9 @@ chmod 644 "$WORK/fleet.conf"
 echo "Test 2: -n plan"
 run_fleet -c "$WORK/fleet.conf" -n
 assert_eq "-n exits 0" 0 "$RC"
-assert_contains "plan password target" "$OUT" "pri.world                triage  tns/password pri.world"
-assert_contains "plan wallet target with tns + mode" "$OUT" "STB                      diag    tns/wallet stb.world"
-assert_contains "plan ssh inferred" "$OUT" "host2                    triage  ssh oracle@dg2 sid=cdb1"
+assert_contains "plan password target" "$OUT" "pri.world                triage       tns/password pri.world"
+assert_contains "plan wallet target with tns + mode" "$OUT" "STB                      diag         tns/wallet stb.world"
+assert_contains "plan ssh inferred" "$OUT" "host2                    triage       ssh oracle@dg2 sid=cdb1"
 assert_contains "plan count" "$OUT" "4 target(s) would be checked"
 assert_contains "world-readable password warning" "$OUT" "readable by group/others"
 assert_eq "-n runs nothing" "" "$(cat "$STUB_LOG")"
@@ -270,6 +276,135 @@ run_fleet -c "$WORK/mode.conf" --diag
 LOG="$(cat "$STUB_LOG")"
 assert_contains "--diag -> dg_diag_sid.sh for a" "$LOG" "TOOL=dg_diag_sid.sh"
 assert_contains "mode=triage overrides --diag for b" "$LOG" "TOOL=dg_triage_sid.sh"
+
+echo "Test 8: --check / --review-config and per-target scope"
+cat > "$WORK/scope.conf" <<EOC
+[a.world]
+auth = wallet
+[b.world]
+auth = wallet
+scope = review-config
+EOC
+run_fleet -c "$WORK/scope.conf" --check -n
+assert_contains "plan shows check mode" "$OUT" "a.world                  triage/check tns/wallet a.world"
+assert_contains "plan shows scope=review-config override" "$OUT" "b.world                  triage       tns/wallet b.world"
+run_fleet -c "$WORK/scope.conf" --check
+LOG="$(cat "$STUB_LOG")"
+assert_contains "--check passed to the tool" "$LOG" "ARGS=-t a.world --no-color --check"
+assert_contains "scope=review-config target gets no --check" "$LOG" "ARGS=-t b.world --no-color"
+assert_not_contains "no verdict line when a target ran review-config" "$OUT" "VERDICT:"
+run_fleet -c "$WORK/scope.conf" --check --only a.world
+assert_contains "check verdict: all OK" "$OUT" "VERDICT: Data Guard is running as configured (1 target(s))"
+export STUB_RC_a_world=1
+run_fleet -c "$WORK/scope.conf" --check --only a.world
+assert_contains "check verdict: degraded" "$OUT" "VERDICT: Data Guard is running but DEGRADED (a.world)"
+export STUB_RC_a_world=2
+run_fleet -c "$WORK/scope.conf" --check --only a.world
+assert_eq "check CRITICAL -> exit 2" 2 "$RC"
+assert_contains "check verdict: not running" "$OUT" "VERDICT: Data Guard is NOT running correctly (problem or not checked: a.world)"
+unset STUB_RC_a_world
+printf '[a]\nauth = wallet\nscope = maybe\n' > "$WORK/badscope.conf"
+run_fleet -c "$WORK/badscope.conf" -n
+assert_eq "bad scope exits 64" 64 "$RC"
+assert_contains "bad scope message" "$OUT" "[a]: scope must be check or review-config"
+run_fleet -c "$WORK/scope.conf" --check --review-config --only a.world
+assert_not_contains "--review-config after --check wins" "$(cat "$STUB_LOG")" "--check"
+run_fleet -c "$WORK/scope.conf" --dry-run
+assert_contains "--dry-run is the long form of -n" "$OUT" "nothing was connected (-n)"
+assert_eq "--dry-run runs nothing" "" "$(cat "$STUB_LOG")"
+
+echo "Test 9: engine grading in --check mode"
+# Sourced in a subshell: feed collected values straight to the assess_*
+# functions and count what is graded vs listed.
+engine_grade() {
+    (
+        source "$ROOT/common/dg_local_status_common.sh"
+        DG_SCOPE="$1"
+        REMOTE_DATA_SOURCE=runtime
+        FSFO_MODE="Enabled in Zero Data Loss Mode"; LOC_FSFO_OBSERVER_PRESENT=YES
+        PRI_ROLE=PRIMARY; PRI_OPEN="READ WRITE"; PRI_SWITCH="TO STANDBY"; PRI_FORCE=NO; PRI_FLASH=NO
+        PRI_DEST2_STATUS=VALID; PRI_SRL=0
+        STB_ROLE="PHYSICAL STANDBY"; STB_OPEN=MOUNTED; STB_MRP_STATUS="${2:-APPLYING_LOG}"
+        STB_RECOVERY_MODE="MANAGED REAL TIME APPLY"; STB_FLASH=NO; STB_SRL=0
+        STB_LAST_APPLIED=10; STB_LAST_RECEIVED=10
+        BROKER_OVERALL=WARNING
+        DGMGRL_CONFIG="$(printf '%s\n' 'Configuration - c' '  Members:' '  cdb1      - Primary database' '    cdb1_stby - Physical standby database' '      Warning: ORA-16827: Flashback Database is disabled' '' 'Configuration Status:' 'WARNING')"
+        SUMMARY_ERRORS=(); SUMMARY_WARNINGS=(); SUMMARY_INFOS=(); ERRORS=0; WARNINGS=0
+        assess_primary; assess_standby; assess_broker
+        printf '%s %s %s %s\n' "$ERRORS" "$WARNINGS" "$PRI_OK" "$STB_OK"
+        printf '%s\n' "${SUMMARY_INFOS[@]}"
+    ) 2>&1
+}
+G="$(engine_grade review)"
+assert_eq "review-config grades config findings" "2 5 false false" "$(printf '%s\n' "$G" | head -1)"
+G="$(engine_grade check)"
+assert_eq "check mode: config findings not graded" "0 0 true true" "$(printf '%s\n' "$G" | head -1)"
+assert_contains "check lists flashback as Info" "$G" "Not graded (--check): Standby flashback NO (FSFO needs it)"
+assert_contains "check lists force logging as Info" "$G" "Not graded (--check): Primary force logging is NO"
+assert_contains "check lists broker config warning as Info" "$G" "Not graded (--check): Broker overall status is WARNING (configuration diagnoses only)"
+G="$(engine_grade check MRP0_NOT_RUNNING)"
+assert_eq "check mode still grades a stopped MRP" "1 0 true false" "$(printf '%s\n' "$G" | head -1)"
+
+echo "Test 10: engine components - standbys, FSFO status, observer pings"
+# $1 = SHOW OBSERVER text, $2 = local FS_FAILOVER_STATUS, $3 = "render" to
+# print the --check output instead of the counts.
+engine_components() {
+    (
+        source "$ROOT/common/dg_local_status_common.sh"
+        dg_render_init_colors 1
+        OBS_TEXT="$1"
+        run_dgmgrl() {
+            case "$1" in
+                "SHOW DATABASE 'cdb1_stby'") printf '%s\n' 'Database - cdb1_stby' '  Role:               PHYSICAL STANDBY' '  Intended State:     APPLY-ON' '  Transport Lag:      0 seconds (computed 1 second ago)' '  Apply Lag:          0 seconds (computed 1 second ago)' 'Database Status:' 'SUCCESS' ;;
+                "SHOW DATABASE 'cdb1_stb2'") printf '%s\n' 'Database - cdb1_stb2' '  Role:               PHYSICAL STANDBY' '  Intended State:     APPLY-ON' '  Transport Lag:      0 seconds (computed 1 second ago)' '  Apply Lag:          5 minutes 3 seconds (computed 1 second ago)' 'Database Status:' 'SUCCESS' ;;
+                "SHOW OBSERVER") printf '%s\n' "$OBS_TEXT" ;;
+            esac
+        }
+        DG_SCOPE=check; TARGET_TNS=""; IS_PRIMARY=true; LOCAL_INSTANCE_AVAILABLE=true
+        LOC_DBUNIQ=cdb1; LOC_HOST=dg1.example; LOC_LABEL=PRIMARY; PEER_DBUNIQ=""; DGMGRL_PEER=""
+        DGMGRL_CONFIG="$(printf '%s\n' 'Configuration - cfg' '  Members:' '  cdb1      - Primary database' '    cdb1_stby - (*) Physical standby database' '    cdb1_stb2 - Physical standby database' '    cdb1_stb3 - Physical standby database (disabled)' 'Configuration Status:' 'SUCCESS')"
+        DGMGRL_FSFO="$(printf '%s\n' 'Fast-Start Failover: Enabled in Zero Data Loss Mode' '  Threshold:          30 seconds' '  Active Target:      cdb1_stby')"
+        LOC_FSFO_STATUS="$2"; LOC_FSFO_OBSERVER_PRESENT=YES
+        BROKER_CFG_NAME=cfg; BROKER_OVERALL=SUCCESS; BROKER_STATE=OK
+        PRI_ROLE=PRIMARY; PRI_OPEN="READ WRITE"; PRI_DEST2_STATUS=VALID; PRI_OK=true; PRI_DBUNIQ=cdb1
+        collect_components
+        parse_fsfo_fields
+        SUMMARY_ERRORS=(); SUMMARY_WARNINGS=(); SUMMARY_INFOS=(); ERRORS=0; WARNINGS=0
+        assess_components
+        if [[ "${3:-}" == render ]]; then
+            render_check_output
+        else
+            printf '%s %s\n' "$ERRORS" "$WARNINGS"
+            printf '%s\n' "${SUMMARY_ERRORS[@]}" "${SUMMARY_WARNINGS[@]}"
+        fi
+    ) 2>&1
+}
+OBS_OK="$(printf '%s\n' 'Observer "obs1" - Master' '  Host Name:                    obs.example' '  Last Ping to Primary:         2 seconds ago' '  Last Ping to Target:          3 seconds ago')"
+OBS_BAD="$(printf '%s\n' 'Observer "obs1" - Master' '  Host Name:                    obs.example' '  Last Ping to Primary:         2 seconds ago' '  Last Ping to Target:          95 seconds ago' '' 'Observer "obs2" - Backup' '  Host Name:                    obs2.example' '  Last Ping to Primary:         (unknown)' '  Last Ping to Target:          1 second ago')"
+G="$(engine_components "$OBS_OK" SYNCHRONIZED)"
+assert_eq "healthy observer: only the lagging 2nd standby is flagged" "0 1" "$(printf '%s\n' "$G" | head -1)"
+assert_contains "second standby's apply lag graded" "$G" "Standby cdb1_stb2: apply lag 5 minutes 3 seconds"
+assert_not_contains "disabled standby not graded" "$G" "cdb1_stb3"
+G="$(engine_components "$OBS_BAD" SYNCHRONIZED)"
+assert_eq "stale Master = error, stale Backup = warning" "1 2" "$(printf '%s\n' "$G" | head -1)"
+assert_contains "Master lost the target" "$G" "Observer obs1 (Master): last ping to the target 95 seconds ago (limit 30s)"
+assert_contains "Backup never reached the primary" "$G" "Observer obs2 (Backup): last ping to the primary (unknown) (limit 30s)"
+G="$(DG_OBSERVER_PING_MAX=120 engine_components "$OBS_BAD" SYNCHRONIZED)"
+assert_eq "DG_OBSERVER_PING_MAX raises the limit" "0 2" "$(printf '%s\n' "$G" | head -1)"
+G="$(engine_components "" SYNCHRONIZED)"
+assert_contains "FSFO enabled, no observer listed = error" "$G" "FSFO is enabled but the broker lists no observer"
+G="$(engine_components "$OBS_OK" UNSYNCHRONIZED)"
+assert_contains "FSFO UNSYNCHRONIZED = error" "$G" "FSFO status on cdb1 is UNSYNCHRONIZED (automatic failover is not ready)"
+G="$(engine_components "$OBS_OK" "PRIMARY UNOBSERVED")"
+assert_eq "PRIMARY UNOBSERVED = error" "1 1" "$(printf '%s\n' "$G" | head -1)"
+G="$(engine_components "$OBS_BAD" SYNCHRONIZED render)"
+assert_contains "check output: header with verdict" "$G" "cdb1 @ dg1 (PRIMARY)  NOT RUNNING CORRECTLY"
+assert_contains "check output: one line per standby" "$G" "cdb1_stb2: APPLY-ON, transport 0s, apply 303s"
+assert_contains "check output: disabled standby" "$G" "cdb1_stb3: disabled in the broker"
+assert_contains "check output: observer pings" "$G" "obs1 (Master) @ obs: last ping primary 2s, target 95s"
+assert_contains "check output: problems listed" "$G" "Problem  Observer obs1 (Master): last ping to the target"
+n_lines="$(engine_components "$OBS_OK" SYNCHRONIZED render | grep -c .)"
+assert_eq "check output is compact: header, one line per component, one per problem" 9 "$n_lines"
 
 echo
 echo "============================================================"
