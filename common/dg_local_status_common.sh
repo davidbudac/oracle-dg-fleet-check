@@ -1751,6 +1751,7 @@ collect_components() {
 
 # SHOW OBSERVER (19c):
 #   Observer "dg_observer" - Master
+#   Observer "dg_observer"(19.3.0.0.0) - Master
 #     Host Name:                    ol9-19-dg3.localdomain
 #     Last Ping to Primary:         2 seconds ago
 #     Last Ping to Target:          2 seconds ago
@@ -1762,7 +1763,14 @@ parse_observers() {
             Observer\ \"*)
                 n=${#CHK_OBS_NAME[@]}
                 CHK_OBS_NAME[n]=$(printf '%s' "$t" | sed 's/^Observer "\([^"]*\)".*/\1/')
-                CHK_OBS_ROLE[n]=$(printf '%s' "$t" | sed -n 's/^Observer "[^"]*"[[:space:]]*-[[:space:]]*//p')
+                # Some clients include a parenthesized version after the
+                # name. Strip it before reading the role, otherwise a live
+                # Master has an empty role and is reported as missing.
+                CHK_OBS_ROLE[n]=$(printf '%s' "$t" | sed -n '
+                    s/^Observer "[^"]*"[[:space:]]*//
+                    s/^([^)]*)[[:space:]]*//
+                    s/^-[[:space:]]*//p
+                ')
                 CHK_OBS_HOST[n]=""; CHK_OBS_PPRI[n]=""; CHK_OBS_PTGT[n]=""
                 ;;
             "Host Name:"*)            [[ $n -ge 0 ]] && CHK_OBS_HOST[n]=$(printf '%s' "$t" | sed 's/^Host Name:[[:space:]]*//') ;;
