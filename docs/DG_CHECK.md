@@ -2,8 +2,7 @@
 
 This file documents the two tools `dg_fleet_check.sh` drives. They originate from the [oracle-dataguard-setup](https://github.com/davidbudac/oracle-dataguard-setup) project.
 
-
-The local status flow is now split into two commands that run directly on a DB host, using `sqlplus / as sysdba` locally and DGMGRL-based peer discovery:
+There are two commands; both run directly on a DB host, using `sqlplus / as sysdba` locally and DGMGRL-based peer discovery:
 
 - `dg_triage_sid.sh` for fast operator triage
 - `dg_diag_sid.sh` for deeper diagnostics
@@ -77,10 +76,17 @@ What changes:
   role: PRIMARY|STANDBY)`.
 
 Warning/critical thresholds (FRA %, sequence gaps, lag seconds) are
-env-overridable via `DG_FRA_WARN_PCT`, `DG_FRA_CRIT_PCT`, `DG_SEQ_GAP_WARN`,
-`DG_SEQ_GAP_CRIT`, `DG_LAG_WARN_SECONDS` -- see
-[DG_STATUS.md](DG_STATUS.md#thresholds) for defaults and meaning. A value that
-is not a non-negative integer (`80%`) is a usage error (exit `64`).
+env-overridable:
+
+| Variable              | Default | Meaning                                                        |
+|-----------------------|---------|----------------------------------------------------------------|
+| `DG_FRA_WARN_PCT`     | 80      | FRA usage % at or above which it is a warning                  |
+| `DG_FRA_CRIT_PCT`     | 90      | FRA usage % at or above which it is an error                   |
+| `DG_SEQ_GAP_WARN`     | 1       | sequence lag above which it is a warning                       |
+| `DG_SEQ_GAP_CRIT`     | 5       | sequence lag above which it is an error                        |
+| `DG_LAG_WARN_SECONDS` | 60      | transport / apply lag (seconds) above which it is a warning    |
+
+A value that is not a non-negative integer (`80%`) is a usage error (exit `64`).
 
 ## Checking a Whole Fleet: `dg_fleet_check.sh`
 
@@ -109,7 +115,7 @@ host = oracle@dg2            # keys/agent: ssh runs with BatchMode=yes
 sid = cdb1
 # oracle_home = ...          # default: looked up in /etc/oratab on the host
 # ssh_opts = -p 2222 -i ~/.ssh/dg
-# remote_dir = /home/oracle/dataguard_setup   # existing copy instead of shipping
+# remote_dir = /home/oracle/oracle-dg-fleet-check   # existing copy instead of shipping
 # mode = diag                # per-target override
 # scope = check              # per-target mode: check|review-config
 ```
@@ -170,16 +176,16 @@ Default remote behavior:
 
 Exit codes:
 
-- `0` healthy
+- `0` healthy, also when the peer is only visible through the broker (no
+  wallet/password): that is an `Info` line, not a warning, as long as the
+  broker reports the peer
 - `1` warning
-- `2` in network mode when the target cannot be opened (unreachable alias,
-  wrong or missing password); `64` for a bad flag (`-t` without a value,
-  `--peer-tns` without `-t`, a quote in an alias)
-- `0` also when the peer is only visible through the broker (no wallet/password):
-  that is an `Info` line, not a warning, as long as the broker reports the peer
-- `2` error (including a local instance that is down — see below)
-- `64` usage or preflight failure (unknown flag, `ORACLE_SID`/`ORACLE_HOME`
-  unset, malformed threshold variable)
+- `2` error, including a local instance that is down (see below) and, in
+  network mode, a target that cannot be opened (unreachable alias, wrong or
+  missing password)
+- `64` usage or preflight failure: unknown or bad flag (`-t` without a value,
+  `--peer-tns` without `-t`, a quote in an alias), `ORACLE_SID`/`ORACLE_HOME`
+  unset, malformed threshold variable
 
 ### `dg_diag_sid.sh`
 
@@ -196,14 +202,6 @@ Default remote behavior:
 2. if wallet fails, prompt for SYS password unless `-L`
 
 Exit codes are the same as `dg_triage_sid.sh`.
-
-### `dg_check_sid.sh` (deprecated)
-
-Compatibility behavior:
-
-- prints `DEPRECATED: Use dg_triage_sid.sh` to stderr
-- forwards flags unchanged
-- always exits `0`
 
 ## Modes: Review Configuration and Check
 
@@ -265,10 +263,7 @@ wrong `ORACLE_SID`, a bad `ORACLE_HOME` — the tool says so explicitly:
   Info    Check: ps -ef | grep ora_pmon_cdb1 ; then 'sqlplus / as sysdba' and STARTUP MOUNT
 ```
 
-and exits `2`, with a `Local Instance ... DOWN` row in AT A GLANCE. Previously
-every field parsed empty, every check was skipped because it was gated on a
-non-empty role, and the tool most likely to be run *because* the database is
-down reported `WARNING` / exit `1` without ever saying "down".
+and exits `2`, with a `Local Instance ... DOWN` row in AT A GLANCE.
 
 ## What The Scripts Check
 
@@ -279,7 +274,7 @@ Both commands use the same shared collector and grading rules. The difference is
 - Database role and open mode
 - Protection mode
 - Switchover status -- anything other than `TO STANDBY` / `SESSIONS ACTIVE` is a
-  **warning**, as in `dg_status.sh`
+  **warning**
 - Force logging
 - Flashback -- **informational** (`Info`) unless Fast-Start Failover is enabled;
   with FSFO on, Flashback Database is what makes reinstating the old primary
@@ -290,8 +285,6 @@ Both commands use the same shared collector and grading rules. The difference is
   `DG Broker` row reads `unknown (dg_broker_start is only readable on the local
   instance)` in the diagnostics output (the triage output simply omits the
   row) and the standby section shows the standby's own value instead.
-  (It used to publish the standby's local value as the primary's, producing a
-  "dg_broker_start is FALSE" finding pointed at the wrong host.)
 - Services
 - Online redo and standby redo counts
 - Archive destination 2 status; a dest 2 that targets a member other than the
@@ -309,14 +302,13 @@ Both commands use the same shared collector and grading rules. The difference is
 - `dg_broker_start` (only when running on the standby -- see the primary list)
 - Recovery mode -- anything other than real-time apply is **informational**
   (`Info` line, plain row): a standby without `USING CURRENT LOGFILE`, or with
-  a configured `DelayMins`, is a valid configuration (`dg_status.sh` still
-  flags it with `!!`)
+  a configured `DelayMins`, is a valid configuration
 - Transport lag
 - Apply lag
 - Apply finish time
 - Sequence lag
-- Replication state (`Redo Apply` row) -- derived by the same function
-  `dg_status.sh` uses (`dg_repl_state` in `common/dg_render_common.sh`). When
+- Replication state (`Redo Apply` row) -- derived by `dg_repl_state` in
+  `common/dg_render_common.sh`. When
   the standby returned no transport lag, apply lag *and* no sequence data the
   row reads `UNKNOWN` and a warning is raised; it is never a green `IN SYNC`
   by default. A missing `APPLYINFO` row (the apply-info SQL errored) is graded
@@ -335,7 +327,7 @@ Both commands use the same shared collector and grading rules. The difference is
 
 - Configuration presence
 - Overall broker status (`ERROR` -> error/exit 2, red; `WARNING` -> warning/exit 1,
-  amber -- the same colours and icons `dg_status.sh` uses)
+  amber)
 - Member warnings / errors. 19c prints a member's diagnosis on the line *after*
   the member line:
 
@@ -351,7 +343,7 @@ Both commands use the same shared collector and grading rules. The difference is
   never show a green `OK` directly above its own `Error:`. `Error: 0` is
   DGMGRL's healthy value and is not treated as a finding.
 - Fast-Start Failover mode -- **disabled is informational**, not a warning:
-  FSFO is an optional add-on (step 9) and a manual-failover configuration is
+  FSFO is an optional add-on and a manual-failover configuration is
   complete without it. The row reads `Disabled (optional)` with no icon
 - FSFO target
 - Every standby member, not just the peer: the broker's transport / apply lag
@@ -372,8 +364,7 @@ Both commands use the same shared collector and grading rules. The difference is
   (network mode on an Instant Client) only the presence below is checked.
 - Observer presence / host. `V$DATABASE.FS_FAILOVER_OBSERVER_PRESENT` is the
   authority on whether an observer is actually connected. **FSFO enabled with
-  no observer present is an error** (automatic failover will not happen) -- the
-  same grade `dg_status.sh` gives it. With FSFO disabled, no observer is
+  no observer present is an error** (automatic failover will not happen). With FSFO disabled, no observer is
   expected and the row carries no icon at all.
 
 ## Data Source Modes
@@ -409,20 +400,22 @@ Both commands inspect the local alert log and broker log:
 - `dg_triage_sid.sh` shows compressed recent events only
 - `dg_diag_sid.sh` shows longer excerpts
 
-The **path that was actually read is always printed** (it used to be hidden
-behind `DG_DEBUG=1`), and three outcomes are rendered distinctly:
+The **path that was actually read is always printed**, and three outcomes are rendered distinctly:
 
 - `(log path unknown: V$DIAG_INFO 'Diag Trace' returned nothing)`
 - `(file not found)` -- the usual symptom of a non-default `diagnostic_dest`
   or an `ORACLE_SID` that does not match the log file name
 - `(0 matched - file read, no Data Guard entries)` -- a genuinely quiet log
 
-Previously the last two both printed `(none)`, so "I am looking in the wrong
-place" and "nothing happened" were indistinguishable.
+The last two keep "I am looking in the wrong place" apart from "nothing
+happened".
 
 ## Wallet Usage
 
-These commands work best with wallet-based peer authentication configured via [WALLET_SETUP.md](WALLET_SETUP.md). With a wallet in place, peer runtime queries can use:
+These commands work best with wallet-based peer authentication: an
+auto-login wallet holding a SYS credential under each peer's TNS alias (the
+[oracle-dataguard-setup](https://github.com/davidbudac/oracle-dataguard-setup)
+project sets one up). With a wallet in place, peer runtime queries can use:
 
 ```bash
 sqlplus /@peer_tns_alias as sysdba
@@ -432,7 +425,7 @@ The wallet probe connects with the alias **exactly as the broker reports it**
 (`/@alias`). (Confirmed on a 19c lab: a credential stored under the alias
 connects as `/@alias` but fails with ORA-01017 when the same address is given
 as an inline `(DESCRIPTION=...)`.) The external password store matches
-credentials on the connect string text, and `common/setup_dg_wallet.sh` stores them under the alias, so
+credentials on the connect string text and the credentials are stored under the alias, so
 the alias is never rewritten into a descriptor for this connect. The probe is
 time-bounded from outside instead (`REMOTE_TEST_TIMEOUT`, default 5 s): the
 `timeout` binary when present, otherwise a portable background-and-kill

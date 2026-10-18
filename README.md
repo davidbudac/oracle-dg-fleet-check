@@ -45,6 +45,7 @@ bash dg_fleet_check.sh -c fleet.conf -q            # reports only for targets th
 bash dg_fleet_check.sh -c fleet.conf --diag        # deep diagnostics instead of triage
 bash dg_fleet_check.sh -c fleet.conf --check       # check: only "is Data Guard running as configured?"
 bash dg_fleet_check.sh -c fleet.conf --only prod.world,dg2-prod
+bash dg_fleet_check.sh -c fleet.conf --no-color   # plain output (also NO_COLOR, or stdout not a terminal)
 ```
 
 Requirements: for `password`/`wallet` targets an Oracle client with `sqlplus` on this host (`ORACLE_HOME` or `PATH`; `dgmgrl` optional) and TNS resolution of the alias; for `ssh` targets only ssh. The DB host needs nothing installed: the tool is shipped over the ssh connection into a private temp dir and removed afterwards.
