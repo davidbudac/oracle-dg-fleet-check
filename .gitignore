@@ -1,2 +1,3 @@
 *.conf
 !templates/*.template
+dg_fleet_reports/

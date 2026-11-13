@@ -38,8 +38,15 @@
 # findings (flashback, force logging, standby redo logs, FRA headroom) are
 # listed but never change the result.
 #
+# --html writes the whole run as one self-contained HTML file (summary,
+# verdict, one card per target with its findings and report) instead of the
+# per-target text reports; the file name is generated
+# (dg_fleet_<config>_<check|review>_<YYYYmmdd-HHMMSS>.html) in --report-dir
+# (default $DG_FLEET_REPORT_DIR, else ./dg_fleet_reports).
+#
 # Exit code: the worst per-target result - 0 all OK, 1 warnings, 2 at least
-# one CRITICAL or a target that could not be checked; 64 usage/config error.
+# one CRITICAL or a target that could not be checked; 64 usage/config error;
+# 73 the HTML report could not be written.
 # ============================================================
 
 set -uo pipefail
@@ -56,10 +63,13 @@ QUIET=false
 DRY_RUN=false
 NO_COLOR_FLAG=false
 ONLY_LIST=""
+HTML=false
+REPORT_DIR="${DG_FLEET_REPORT_DIR:-./dg_fleet_reports}"
 
 usage() {
     cat <<USAGE
-Usage: $(basename "$0") -c CONFIG [--diag] [--check|--review-config] [--only NAME[,NAME...]] [-q] [-n] [--no-color]
+Usage: $(basename "$0") -c CONFIG [--diag] [--check|--review-config] [--only NAME[,NAME...]]
+                         [--html [--report-dir DIR]] [-q] [-n] [--no-color]
 
   -c, --config FILE  targets file (see the header of this script for the format)
       --diag         run dg_diag_sid.sh instead of dg_triage_sid.sh
@@ -69,13 +79,20 @@ Usage: $(basename "$0") -c CONFIG [--diag] [--check|--review-config] [--only NAM
                      review-configuration mode (default): grade the running state
                      and the configuration
       --only NAMES   check only these [targets] (comma separated, repeatable)
+      --html         write one self-contained HTML report instead of the text
+                     reports; stdout keeps the progress and the fleet summary
+      --report-dir DIR
+                     where --html files go (created if missing; implies --html);
+                     default \$DG_FLEET_REPORT_DIR, else ./dg_fleet_reports.
+                     File name: dg_fleet_<config>_<check|review>_<YYYYmmdd-HHMMSS>.html
   -q, --quiet        print a target's report only when it is not OK
   -n, --dry-run      parse and validate the config, print the plan, connect nowhere
       --no-color     disable colored output
   -h, --help         this help
 
 Environment: DG_FLEET_TARGET_TIMEOUT (default 900) bounds each target's wall
-clock when the timeout binary exists; DG_TARGET_TIMEOUT, DG_* thresholds are
+clock when the timeout binary exists; DG_FLEET_REPORT_DIR sets the default
+--report-dir; DG_TARGET_TIMEOUT, DG_* thresholds are
 passed through to the tools.
 USAGE
 }
@@ -99,6 +116,14 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 && -n "$2" ]] || die_usage "option $1 requires a target name"
             ONLY_LIST="${ONLY_LIST:+${ONLY_LIST},}$2"; shift 2 ;;
         --only=*) ONLY_LIST="${ONLY_LIST:+${ONLY_LIST},}${1#--only=}"; shift ;;
+        --html) HTML=true; shift ;;
+        --report-dir)
+            [[ $# -ge 2 && -n "$2" ]] || die_usage "option $1 requires a directory"
+            REPORT_DIR="$2"; HTML=true; shift 2 ;;
+        --report-dir=*)
+            REPORT_DIR="${1#--report-dir=}"; HTML=true
+            [[ -n "$REPORT_DIR" ]] || die_usage "option --report-dir requires a directory"
+            shift ;;
         -q|--quiet) QUIET=true; shift ;;
         -n|--dry-run) DRY_RUN=true; shift ;;
         --no-color) NO_COLOR_FLAG=true; shift ;;
@@ -256,6 +281,40 @@ fi
 
 [[ $CONFIG_ERRORS -eq 0 ]] || exit 64
 
+# --html: the file name is fixed now, the directory checked before any
+# connection (a run that cannot store its report must not run).
+RUN_STAMP="$(date '+%Y%m%d-%H%M%S')"
+RUN_STARTED="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+REPORT_FILE=""
+if $HTML; then
+    # shellcheck source=common/dg_fleet_html.sh
+    . "$SCRIPT_DIR/common/dg_fleet_html.sh" || { printf 'ERROR: cannot load %s/common/dg_fleet_html.sh\n' "$SCRIPT_DIR" >&2; exit 64; }
+    if [[ -e "$REPORT_DIR" && ! -d "$REPORT_DIR" ]]; then
+        printf 'ERROR: --report-dir %s exists and is not a directory\n' "$REPORT_DIR" >&2; exit 64
+    fi
+    if ! $DRY_RUN; then
+        mkdir -p "$REPORT_DIR" 2>/dev/null || { printf 'ERROR: cannot create --report-dir %s\n' "$REPORT_DIR" >&2; exit 64; }
+        [[ -w "$REPORT_DIR" ]] || { printf 'ERROR: --report-dir %s is not writable\n' "$REPORT_DIR" >&2; exit 64; }
+    fi
+    cfg_base="$(basename "$CONFIG_FILE")"
+    cfg_base="${cfg_base%.conf}"; cfg_base="${cfg_base%.ini}"; cfg_base="${cfg_base%.cfg}"
+    cfg_base="$(printf '%s' "$cfg_base" | tr -c 'A-Za-z0-9._-' '_')"
+    [[ "$GLOBAL_SCOPE" == "check" ]] && scope_tag="check" || scope_tag="review"
+    REPORT_FILE="${REPORT_DIR%/}/dg_fleet_${cfg_base}_${scope_tag}_${RUN_STAMP}.html"
+    n_try=2
+    while [[ -e "$REPORT_FILE" ]]; do
+        REPORT_FILE="${REPORT_DIR%/}/dg_fleet_${cfg_base}_${scope_tag}_${RUN_STAMP}-${n_try}.html"
+        n_try=$((n_try + 1))
+    done
+    if ! $DRY_RUN; then
+        HTML_WORK="$(mktemp -d "${TMPDIR:-/tmp}/dg_fleet_html.XXXXXX" 2>/dev/null)" || {
+            HTML_WORK="${TMPDIR:-/tmp}/dg_fleet_html.$$.$RANDOM"
+            mkdir -m 700 "$HTML_WORK" || { printf 'ERROR: cannot create a temp dir\n' >&2; exit 64; }
+        }
+        trap 'rm -rf "$HTML_WORK"' EXIT
+    fi
+fi
+
 if $PASSWORD_IN_CONFIG; then
     perms="$(ls -ld "$CONFIG_FILE" 2>/dev/null | cut -c5-10)"
     case "$perms" in
@@ -315,7 +374,7 @@ build_remote_command() {
 
 pass_through_flags() {
     local f="--no-color"
-    $NO_COLOR_FLAG || [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]] || $QUIET || f=""
+    $NO_COLOR_FLAG || [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]] || $QUIET || $HTML || f=""
     [[ "$1" == "check" ]] && f="${f:+$f }--check"
     printf '%s' "$f"
 }
@@ -326,7 +385,10 @@ run_target() {
     tool="$(tool_for_mode "$mode")"
     flags="$(pass_through_flags "${T_SCOPE[$idx]:-$GLOBAL_SCOPE}")"
     out_file=""
-    if $QUIET; then
+    if $HTML; then
+        out_file="$HTML_WORK/out.$idx"
+        exec 3>"$out_file" || { printf 'ERROR: cannot write %s\n' "$out_file" >&2; return 2; }
+    elif $QUIET; then
         out_file="${TMPDIR:-/tmp}/dg_fleet.$$.$idx"
         exec 3>"$out_file" || { printf 'ERROR: cannot write %s\n' "$out_file" >&2; return 2; }
     else
@@ -361,7 +423,7 @@ run_target() {
             ;;
     esac
     exec 3>&-
-    if $QUIET; then
+    if $QUIET && ! $HTML; then
         if [[ $rc -ne 0 ]]; then cat "$out_file"; fi
         rm -f "$out_file"
     fi
@@ -389,7 +451,7 @@ verdict_of() {
     esac
 }
 
-R_NAME=(); R_METHOD=(); R_VERDICT=(); R_SECS=(); R_RC=()
+R_NAME=(); R_METHOD=(); R_VERDICT=(); R_SECS=(); R_RC=(); R_IDX=(); R_MODE=(); R_PLAIN=()
 WORST=0
 NRUN=0
 ALL_CHECK=true
@@ -415,6 +477,10 @@ while [[ $i -lt $NT ]]; do
     R_VERDICT[NRUN]="$(verdict_of "$rc")"
     R_SECS[NRUN]=$((SECONDS - start))
     R_RC[NRUN]=$rc
+    R_IDX[NRUN]=$i
+    R_MODE[NRUN]="$mode"
+    R_PLAIN[NRUN]="$(C_RED=''; C_GREEN=''; C_YELLOW=''; C_NC=''; verdict_of "$rc")"
+    $HTML && printf '  -> %s (%ss)\n' "${R_VERDICT[NRUN]}" "${R_SECS[NRUN]}"
     NRUN=$((NRUN + 1))
     case "$rc" in
         0) ;;
@@ -426,6 +492,7 @@ done
 
 if $DRY_RUN; then
     printf '\n%s target(s) would be checked; nothing was connected (-n).\n' "$NRUN"
+    $HTML && printf 'HTML report would be written to %s\n' "$REPORT_FILE"
     exit 0
 fi
 
@@ -457,6 +524,15 @@ if $ALL_CHECK && [[ $NRUN -gt 0 ]]; then
         printf '%sVERDICT: Data Guard is running but DEGRADED%s (%s)\n' "$C_YELLOW" "$C_NC" "$degraded"
     else
         printf '%sVERDICT: Data Guard is running as configured%s (%s target(s))\n' "$C_GREEN" "$C_NC" "$NRUN"
+    fi
+fi
+
+if $HTML; then
+    if html_write_report "$REPORT_FILE"; then
+        printf '\nHTML report: %s\n' "$REPORT_FILE"
+    else
+        printf 'ERROR: could not write the HTML report %s\n' "$REPORT_FILE" >&2
+        exit 73
     fi
 fi
 exit $WORST

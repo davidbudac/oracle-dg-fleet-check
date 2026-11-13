@@ -31,6 +31,9 @@
 #   - engine components: every standby member's broker lag, FSFO status,
 #     observer pings to primary and target (Master stale = error, Backup
 #     stale = warning, no observer = error), the compact --check output
+#   - --html / --report-dir: generated file name, directory checks before
+#     any connection, text reports kept off stdout, escaping, exit code
+#     unchanged; the text-report parser on real engine output
 # ============================================================
 
 PASS=0
@@ -69,6 +72,7 @@ assert_not_contains() {
 cp "$ROOT/dg_fleet_check.sh" "$WORK/repo/"
 : > "$WORK/repo/common/dg_local_status_common.sh"
 : > "$WORK/repo/common/dg_render_common.sh"
+cp "$ROOT/common/dg_fleet_html.sh" "$WORK/repo/common/"
 # The stub tool: logs argv, stdin, env; exit code from STUB_RC_<alias|sid>
 # (alias dots/@ mapped to _) - default 0.
 for t in dg_triage_sid.sh dg_diag_sid.sh; do
@@ -95,6 +99,7 @@ rc="${!rc_var:-0}"
     printf 'RC=%s\n' "$rc"
 } >> "$log"
 printf 'REPORT from %s for %s (rc %s)\n' "$me" "$key" "$rc"
+[[ -n "${STUB_EXTRA:-}" ]] && printf '%s\n' "$STUB_EXTRA"
 exit "$rc"
 STUB
     chmod +x "$WORK/repo/$t"
@@ -423,6 +428,81 @@ assert_contains "check output: observer pings" "$G" "obs1 (Master) @ obs: last p
 assert_contains "check output: problems listed" "$G" "Problem  Observer obs1 (Master): last ping to the target"
 n_lines="$(engine_components "$OBS_OK" SYNCHRONIZED render | grep -c .)"
 assert_eq "check output is compact: header, one line per component, one per problem" 9 "$n_lines"
+
+echo "Test 11: --html report"
+cat > "$WORK/html.conf" <<EOC
+[a.world]
+auth = wallet
+[b.world]
+auth = wallet
+[dead]
+host = dg1
+sid = cdb1
+EOC
+export STUB_RC_b_world=1
+STUB_EXTRA='<script>alert(1)</script> & "q"' run_fleet -c "$WORK/html.conf" --check --report-dir "$WORK/rep/sub"
+unset STUB_RC_b_world
+assert_eq "--html keeps the worst exit code (ssh 255 -> 2)" 2 "$RC"
+n_html="$(ls "$WORK/rep/sub" 2>/dev/null | grep -c '^dg_fleet_html_check_[0-9]\{8\}-[0-9]\{6\}\.html$')"
+assert_eq "--report-dir created, one generated file name" 1 "$n_html"
+HF="$(ls "$WORK/rep/sub"/*.html 2>/dev/null | head -1)"
+H="$(cat "$HF" 2>/dev/null)"
+assert_contains "stdout names the report" "$OUT" "HTML report: $HF"
+assert_not_contains "text reports are not printed" "$OUT" "REPORT from"
+assert_contains "stdout keeps the fleet summary" "$OUT" "Fleet summary (3 target(s)"
+assert_contains "html: single file with inline style" "$H" "<style>"
+assert_not_contains "html: no external resources" "$H" "<link "
+assert_contains "html: check verdict" "$H" "Data Guard is NOT running correctly"
+assert_contains "html: target card" "$H" 'id="t1"'
+assert_contains "html: tool output kept" "$H" "REPORT from dg_triage_sid.sh for b.world (rc 1)"
+assert_contains "html: output escaped" "$H" "&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;q&quot;"
+assert_not_contains "html: no raw markup from the tool" "$H" "<script>alert(1)"
+assert_contains "html: ssh failure reason" "$H" "ssh connection, rc 255"
+assert_contains "html: ssh error is the key finding" "$H" "Connection refused"
+assert_eq "html: no temp files left" "" "$(ls "$WORK/rep/sub" | grep -v '\.html$')"
+run_fleet -c "$WORK/html.conf" --html -n --report-dir "$WORK/rep/never"
+assert_eq "--html -n exits 0" 0 "$RC"
+assert_contains "--html -n shows the file it would write" "$OUT" "HTML report would be written to $WORK/rep/never/dg_fleet_html_review_"
+assert_eq "--html -n creates nothing" "no" "$([[ -e "$WORK/rep/never" ]] && echo yes || echo no)"
+: > "$WORK/rep/afile"
+run_fleet -c "$WORK/html.conf" --report-dir "$WORK/rep/afile"
+assert_eq "--report-dir on a file exits 64" 64 "$RC"
+assert_eq "nothing ran when the report dir is bad" "" "$(cat "$STUB_LOG")"
+run_fleet -c "$WORK/html.conf" --report-dir
+assert_eq "--report-dir without a value exits 64" 64 "$RC"
+(cd "$WORK" && DG_FLEET_REPORT_DIR="$WORK/rep/env" bash "$FLEET" -c "$WORK/html.conf" --html --only a.world >/dev/null 2>&1)
+assert_eq "DG_FLEET_REPORT_DIR is the default --report-dir" 1 "$(ls "$WORK/rep/env" 2>/dev/null | grep -c '\.html$')"
+
+# The parser on real engine output: the --check render and a review-config
+# style report (header + rule, wrapped row, Overall counts, findings).
+H="$(
+    source "$ROOT/common/dg_fleet_html.sh"
+    engine_components "$OBS_BAD" SYNCHRONIZED render > "$WORK/chk.txt"
+    html_render_target_body "$WORK/chk.txt" 8 "$WORK/chk.meta"
+)"
+assert_contains "parser: check title" "$H" "<strong>cdb1 @ dg1 (PRIMARY)</strong><span class=\"chip\">NOT RUNNING CORRECTLY</span>"
+assert_contains "parser: component row with status" "$H" "<th>Observer</th><td>obs1 (Master) @ obs: last ping primary 2s, target 95s</td><td><span class=\"pill crit\">FAIL</span>"
+assert_contains "parser: Problem row is a finding, wrapped text joined" "$H" "<li class=\"f-crit\"><span class=\"pill crit\">ERROR</span><span>Observer obs1 (Master): last ping to the target 95 seconds ago (limit 30s)</span>"
+assert_not_contains "parser: Problem rows not repeated as components" "$H" "<th>Problem</th>"
+assert_eq "parser: meta counts and first finding" "1	2	0	crit	Observer obs1 (Master): last ping to the target 95 seconds ago (limit 30s)" "$(cat "$WORK/chk.meta")"
+{
+    printf '\n Data Guard Triage  2026-01-01 00:00:00\n'
+    printf ' Target: x via wallet -> h (instance: x, role: PRIMARY)  |  Peer: y  |  Source: runtime SQL\n\n'
+    printf ' TOP FINDINGS\n ──────────────\n'
+    printf '  %-24s %-30s %s\n' Error "Force logging is NO" XX Warning "Broker overall status is" '!!' '' 'WARNING' ''
+    printf '\n AT A GLANCE\n ──────────────\n'
+    printf '  %-24s %-30s %s\n' Overall "errors=3 warnings=7" CRITICAL "Redo Apply" "transport=none" "IN SYNC"
+    printf '\n RECENT DG EVENTS\n ──────────────\n'
+    printf '  Recent Alert Events: 1 matched\n    2026-01-01 00:00:00  ORA-16000: x <y>\n'
+} > "$WORK/tri.txt"
+H="$(source "$ROOT/common/dg_fleet_html.sh"; html_render_target_body "$WORK/tri.txt" 24 "$WORK/tri.meta")"
+assert_contains "parser: identity line as chips" "$H" "<span class=\"chip\">Peer: y</span>"
+assert_contains "parser: section from header + rule" "$H" "<h3>AT A GLANCE</h3>"
+assert_contains "parser: multi-word status" "$H" "<span class=\"pill ok\">IN SYNC</span>"
+assert_contains "parser: wrapped warning joined" "$H" "<span>Broker overall status is WARNING</span>"
+assert_not_contains "parser: findings section not rendered twice" "$H" "<h3>TOP FINDINGS</h3>"
+assert_contains "parser: log line with time, escaped" "$H" "<time>2026-01-01 00:00:00</time>ORA-16000: x &lt;y&gt;"
+assert_eq "parser: Overall row gives the counts" "3	7	0	crit	Force logging is NO" "$(cat "$WORK/tri.meta")"
 
 echo
 echo "============================================================"

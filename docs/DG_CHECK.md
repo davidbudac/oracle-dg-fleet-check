@@ -128,6 +128,8 @@ bash dg_fleet_check.sh -c fleet.conf --diag -q   # deep check, print only the re
 bash dg_fleet_check.sh -c fleet.conf --only cdb1.world,dg2-cdb1
 bash dg_fleet_check.sh -c fleet.conf -n          # (--dry-run) validate the config, print the plan, connect nowhere
 bash dg_fleet_check.sh -c fleet.conf --check     # check mode: only "is Data Guard running as configured?"
+bash dg_fleet_check.sh -c fleet.conf --html      # one self-contained HTML report instead of the text reports
+bash dg_fleet_check.sh -c fleet.conf --report-dir /srv/dg/reports   # same, into that directory
 ```
 
 Rules:
@@ -154,8 +156,18 @@ Rules:
 - Exit code: the worst target - `0` all OK, `1` at least one WARNING, `2` at
   least one CRITICAL or a target that could not be checked at all (`FAILED`:
   the tool's `64`, remote setup `70`, timeout `124`, ssh `255`); `64` for a
-  usage or config error. Suitable for cron with `-q` (reports only for targets
-  that are not OK, the summary always).
+  usage or config error; `73` when the `--html` report could not be written.
+  Suitable for cron with `-q` (reports only for targets that are not OK, the
+  summary always).
+- `--html` captures every target's report (always `--no-color`) and writes one
+  HTML file `dg_fleet_<config>_<check|review>_<YYYYmmdd-HHMMSS>.html` into
+  `--report-dir` (default `$DG_FLEET_REPORT_DIR`, else `./dg_fleet_reports`;
+  created if missing, validated before any connection). The text reports are
+  parsed back into structure by `common/dg_fleet_html.sh` (section = line above
+  a `─` rule, row = label column / value / trailing status, `Error`/`Warning`/
+  `Info`/`Problem` rows = findings); anything unparsed is shown verbatim and
+  each card also carries the raw text, so an older engine copy (`remote_dir`)
+  still renders. `-q` does not filter the HTML.
 
 ## Command Roles
 

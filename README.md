@@ -46,7 +46,11 @@ bash dg_fleet_check.sh -c fleet.conf --diag        # deep diagnostics instead of
 bash dg_fleet_check.sh -c fleet.conf --check       # check: only "is Data Guard running as configured?"
 bash dg_fleet_check.sh -c fleet.conf --only prod.world,dg2-prod
 bash dg_fleet_check.sh -c fleet.conf --no-color   # plain output (also NO_COLOR, or stdout not a terminal)
+bash dg_fleet_check.sh -c fleet.conf --html                     # one HTML report in ./dg_fleet_reports
+bash dg_fleet_check.sh -c fleet.conf --check --report-dir /srv/dg/reports   # --report-dir implies --html
 ```
+
+`--html` writes the whole run into one self-contained HTML file (inline CSS, no external resources, light/dark): fleet verdict, counts, a summary table, and one card per target with its findings, its report sections and the raw text. Cards that are not OK open expanded; a "Needs attention" filter hides the rest. On stdout only the progress, the fleet summary and the file path remain. The file name is generated: `dg_fleet_<config>_<check|review>_<YYYYmmdd-HHMMSS>.html` (a `-2`, `-3` ... suffix if it exists). The directory is `--report-dir DIR`, else `$DG_FLEET_REPORT_DIR`, else `./dg_fleet_reports`; it is created if missing and checked before anything connects (`64` if unusable).
 
 Requirements: for `password`/`wallet` targets an Oracle client with `sqlplus` on this host (`ORACLE_HOME` or `PATH`; `dgmgrl` optional) and TNS resolution of the alias; for `ssh` targets only ssh. The DB host needs nothing installed: the tool is shipped over the ssh connection into a private temp dir and removed afterwards.
 
@@ -67,7 +71,7 @@ dg2-prod                 ssh oracle@dg2 sid=prod                       8  CRITIC
 | CRITICAL   | errors, or the tool could not log in                                     |
 | FAILED     | not checked: tool usage/env error (64), remote setup (70), timeout (124), ssh (255) |
 
-Exit code = worst target: `0` all OK, `1` warnings, `2` CRITICAL or FAILED, `64` bad config/usage. Use `-q` in cron and act on a non-zero exit.
+Exit code = worst target: `0` all OK, `1` warnings, `2` CRITICAL or FAILED, `64` bad config/usage, `73` the `--html` report could not be written. Use `-q` (or `--html`) in cron and act on a non-zero exit.
 
 ### Two modes: review configuration and check
 
@@ -101,7 +105,8 @@ VERDICT: Data Guard is running as configured (2 target(s))
 ```
 dg_fleet_check.sh                 the wrapper
 dg_triage_sid.sh, dg_diag_sid.sh  the checks (also usable alone: on a DB host, or with -t ALIAS)
-common/                           the engine and render library they source
+common/                           the engine and render library they source;
+                                  dg_fleet_html.sh = the --html report (local only, not shipped)
 templates/dg_fleet.conf.template  config template
 ```
 
