@@ -478,13 +478,19 @@ assert_eq "DG_FLEET_REPORT_DIR is the default --report-dir" 1 "$(ls "$WORK/rep/e
 H="$(
     source "$ROOT/common/dg_fleet_html.sh"
     engine_components "$OBS_BAD" SYNCHRONIZED render > "$WORK/chk.txt"
-    html_render_target_body "$WORK/chk.txt" 8 "$WORK/chk.meta"
+    html_render_target_body "$WORK/chk.txt" 8 "$WORK/chk.meta" "$WORK/chk.find"
 )"
-assert_contains "parser: check title" "$H" "<strong>cdb1 @ dg1 (PRIMARY)</strong><span class=\"chip\">NOT RUNNING CORRECTLY</span>"
-assert_contains "parser: component row with status" "$H" "<th>Observer</th><td>obs1 (Master) @ obs: last ping primary 2s, target 95s</td><td><span class=\"pill crit\">FAIL</span>"
-assert_contains "parser: Problem row is a finding, wrapped text joined" "$H" "<li class=\"f-crit\"><span class=\"pill crit\">ERROR</span><span>Observer obs1 (Master): last ping to the target 95 seconds ago (limit 30s)</span>"
+assert_contains "parser: check title and state" "$H" '<span class="who">cdb1 @ dg1 (PRIMARY)</span><span>State <b class="v-crit">NOT RUNNING CORRECTLY</b></span>'
+assert_contains "parser: primary row" "$H" '<td class="mono">cdb1</td><td>Primary</td><td>READ WRITE, redo transport VALID</td>'
+assert_contains "parser: standby lags split, worse one marked" "$H" '<td class="mono">cdb1_stb2</td><td>Standby</td><td>APPLY-ON</td><td class="num">0s</td><td class="num v-warn">5m 03s</td><td><span class="badge warn">Warning</span>'
+assert_contains "parser: disabled standby" "$H" '<td class="mono muted">cdb1_stb3</td><td>Standby</td><td>disabled in the broker</td>'
+assert_contains "parser: observer row with pings" "$H" '<td class="mono">obs1</td><td>Master</td><td>obs</td><td class="num">2s</td><td class="num v-crit">95s</td><td><span class="badge crit">Fail</span>'
+assert_contains "parser: unknown ping marked" "$H" '<td class="num v-warn">unknown</td>'
+assert_contains "parser: FSFO and broker in the identity strip" "$H" '<span>Failover target <b>cdb1_stby</b></span><span>FSFO status <b>SYNCHRONIZED</b></span><span>Broker <b>cfg: SUCCESS</b></span>'
+assert_not_contains "parser: components not repeated as generic rows" "$H" "<th>Observer</th><td>"
 assert_not_contains "parser: Problem rows not repeated as components" "$H" "<th>Problem</th>"
-assert_eq "parser: meta counts and first finding" "1	2	0	crit	Observer obs1 (Master): last ping to the target 95 seconds ago (limit 30s)" "$(cat "$WORK/chk.meta")"
+assert_contains "parser: Problem row is a finding, wrapped text joined" "$(cat "$WORK/chk.find")" "crit	Observer obs1 (Master): last ping to the target 95 seconds ago (limit 30s)"
+assert_eq "parser: meta counts, components and first finding" "1	2	0	crit	4	2	1	5m 03s	warn	2	0	1	Observer obs1 (Master): last ping to the target 95 seconds ago (limit 30s)" "$(cat "$WORK/chk.meta")"
 {
     printf '\n Data Guard Triage  2026-01-01 00:00:00\n'
     printf ' Target: x via wallet -> h (instance: x, role: PRIMARY)  |  Peer: y  |  Source: runtime SQL\n\n'
@@ -495,14 +501,15 @@ assert_eq "parser: meta counts and first finding" "1	2	0	crit	Observer obs1 (Mas
     printf '\n RECENT DG EVENTS\n ──────────────\n'
     printf '  Recent Alert Events: 1 matched\n    2026-01-01 00:00:00  ORA-16000: x <y>\n'
 } > "$WORK/tri.txt"
-H="$(source "$ROOT/common/dg_fleet_html.sh"; html_render_target_body "$WORK/tri.txt" 24 "$WORK/tri.meta")"
-assert_contains "parser: identity line as chips" "$H" "<span class=\"chip\">Peer: y</span>"
-assert_contains "parser: section from header + rule" "$H" "<h3>AT A GLANCE</h3>"
-assert_contains "parser: multi-word status" "$H" "<span class=\"pill ok\">IN SYNC</span>"
-assert_contains "parser: wrapped warning joined" "$H" "<span>Broker overall status is WARNING</span>"
-assert_not_contains "parser: findings section not rendered twice" "$H" "<h3>TOP FINDINGS</h3>"
+H="$(source "$ROOT/common/dg_fleet_html.sh"; html_render_target_body "$WORK/tri.txt" 24 "$WORK/tri.meta" "$WORK/tri.find")"
+assert_contains "parser: identity line as label/value items" "$H" "<span>Peer <b>y</b></span>"
+assert_contains "parser: section from header + rule" "$H" "<h4>AT A GLANCE</h4>"
+assert_contains "parser: multi-word status" "$H" "<span class=\"badge ok\">IN SYNC</span>"
+assert_contains "parser: wrapped warning joined" "$H" "<li><span class=\"badge warn\">Warning</span><span>Broker overall status is WARNING</span></li>"
+assert_contains "parser: findings file" "$(cat "$WORK/tri.find")" "warn	Broker overall status is WARNING"
+assert_not_contains "parser: findings section not rendered twice" "$H" "<h4>TOP FINDINGS</h4>"
 assert_contains "parser: log line with time, escaped" "$H" "<time>2026-01-01 00:00:00</time>ORA-16000: x &lt;y&gt;"
-assert_eq "parser: Overall row gives the counts" "3	7	0	crit	Force logging is NO" "$(cat "$WORK/tri.meta")"
+assert_eq "parser: Overall row gives the counts" "3	7	0	crit	-	-	-	-	-	-	-	-	Force logging is NO" "$(cat "$WORK/tri.meta")"
 
 echo
 echo "============================================================"

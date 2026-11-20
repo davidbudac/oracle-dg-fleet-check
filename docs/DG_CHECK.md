@@ -165,9 +165,10 @@ Rules:
   created if missing, validated before any connection). The text reports are
   parsed back into structure by `common/dg_fleet_html.sh` (section = line above
   a `─` rule, row = label column / value / trailing status, `Error`/`Warning`/
-  `Info`/`Problem` rows = findings); anything unparsed is shown verbatim and
-  each card also carries the raw text, so an older engine copy (`remote_dir`)
-  still renders. `-q` does not filter the HTML.
+  `Info`/`Problem` rows = findings; in `--check` the `Primary`/`Standby`/
+  `FSFO`/`Observer`/`Broker` rows become a databases table and an observers
+  table); anything unparsed is shown verbatim and each target also carries
+  the raw text, so an older engine copy (`remote_dir`) still renders. `-q` does not filter the HTML.
 
 ## Command Roles
 

@@ -50,7 +50,38 @@ bash dg_fleet_check.sh -c fleet.conf --html                     # one HTML repor
 bash dg_fleet_check.sh -c fleet.conf --check --report-dir /srv/dg/reports   # --report-dir implies --html
 ```
 
-`--html` writes the whole run into one self-contained HTML file (inline CSS, no external resources, light/dark): fleet verdict, counts, a summary table, and one card per target with its findings, its report sections and the raw text. Cards that are not OK open expanded; a "Needs attention" filter hides the rest. On stdout only the progress, the fleet summary and the file path remain. The file name is generated: `dg_fleet_<config>_<check|review>_<YYYYmmdd-HHMMSS>.html` (a `-2`, `-3` ... suffix if it exists). The directory is `--report-dir DIR`, else `$DG_FLEET_REPORT_DIR`, else `./dg_fleet_reports`; it is created if missing and checked before anything connects (`64` if unusable).
+### HTML report
+
+Add `--html` to any run to get one self-contained HTML file instead of the text reports:
+
+```bash
+# 1. check the config and see where the file would go (connects nowhere, writes nothing)
+bash dg_fleet_check.sh -c fleet.conf --check --html -n
+
+# 2. generate it: running-state sweep (tables of databases, lags, observers) ...
+bash dg_fleet_check.sh -c fleet.conf --check --html
+#    ... or the full configuration review
+bash dg_fleet_check.sh -c fleet.conf --html
+
+# 3. the last stdout line names the file
+#    HTML report: ./dg_fleet_reports/dg_fleet_fleet_check_20261120-060004.html
+```
+
+Open the file in any browser. It needs nothing else: inline CSS and JS, no fonts or scripts from the network, so it can be mailed, attached to a ticket or copied to a share. Light and dark follow the browser; printing expands every section.
+
+Where it goes:
+
+- `--report-dir DIR` (implies `--html`), else `$DG_FLEET_REPORT_DIR`, else `./dg_fleet_reports`. The directory is created if missing and checked before anything connects (exit `64` if unusable).
+- File name: `dg_fleet_<config>_<check|review>_<YYYYmmdd-HHMMSS>.html`, with a `-2`, `-3` ... suffix if it already exists. Old reports are never overwritten or removed.
+- On stdout only the progress, the fleet summary and the file path remain. `-q` does not filter the HTML. Exit codes are the same as without `--html` (plus `73` if the file could not be written).
+
+What is in it: the fleet verdict, count cards (healthy / warning / critical), a targets table worst first (with `--check` also standbys OK, max apply lag and observers OK), every error and warning of the fleet in one findings list, and one collapsible detail per target: with `--check` a databases table (role, state, transport and apply lag) and an observers table (pings to primary and target), otherwise the target's findings and report sections; the raw tool output is kept at the bottom. Targets that are not OK open expanded; the "Needs attention" tab hides the rest.
+
+Daily report from cron; a non-zero exit (warnings, critical or not checked) sends a mail:
+
+```cron
+0 6 * * * cd /home/oracle/oracle-dg-fleet-check && DG_FLEET_REPORT_DIR=/srv/dg/reports bash dg_fleet_check.sh -c fleet.conf --check --html >/dev/null 2>&1 || echo "Data Guard fleet not OK, see the latest report in /srv/dg/reports" | mail -s "DG fleet" dba@example.com
+```
 
 Requirements: for `password`/`wallet` targets an Oracle client with `sqlplus` on this host (`ORACLE_HOME` or `PATH`; `dgmgrl` optional) and TNS resolution of the alias; for `ssh` targets only ssh. The DB host needs nothing installed: the tool is shipped over the ssh connection into a private temp dir and removed afterwards.
 

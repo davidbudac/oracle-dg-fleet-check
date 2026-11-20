@@ -6,9 +6,11 @@
 # The per-target reports are the tools' own --no-color text. They are parsed
 # back into structure here (section headers = the line above a rule of "─",
 # rows = label column / value / trailing status, "Error"/"Warning"/"Info"/
-# "Problem" rows = findings) so the engine stays untouched and an older engine
-# copy (remote_dir) still renders. Anything that does not parse is kept as a
-# plain message line, and every card carries the raw text as well.
+# "Problem" rows = findings; in --check the Primary/Standby/FSFO/Observer/
+# Broker rows become database and observer tables) so the engine stays
+# untouched and an older engine copy (remote_dir) still renders. Anything
+# that does not parse is kept as a plain message line, and every target
+# carries the raw text as well.
 #
 # Bash 3.2 / POSIX awk (AIX 7.2): no gensub, no regex intervals, LC_ALL=C so
 # the multibyte rule character is matched as plain bytes.
@@ -22,12 +24,17 @@ DG_FLEET_HTML_SH_LOADED=1
 html_esc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
 html_esc_s() { printf '%s' "$1" | html_esc; }
 
-# One target's text report -> card body HTML on stdout. -v lw = the label
-# column width (24, or 8 in --check), -v meta = file that receives one line
-# "errors<TAB>warnings<TAB>infos<TAB>first-severity<TAB>first-finding".
+# One target's text report -> detail body HTML on stdout.
+#   -v lw    = the label column width (24, or 8 in --check)
+#   -v meta  = file that receives one tab-separated line (empty = "-"):
+#              errors warnings infos first-sev databases standbys standbys-ok
+#              max-apply-lag max-lag-sev observers observers-ok fsfo(0/1)
+#              first-finding
+#   -v findf = file that receives one "sev<TAB>text" line per finding
 DG_HTML_AWK=$(cat <<'AWKEOF'
 function esc(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); gsub(/"/, "\\&quot;", s); return s }
 function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function nz(s) { return (s == "") ? "-" : s }
 function is_hline(s,  t) {
     if (index(s, hc) == 0) return 0
     t = s; gsub(hc, "", t)
@@ -40,12 +47,41 @@ function sevclass(u) {
     return "info"
 }
 function stlabel(u) {
-    if (u == "!!") return "WARN"
-    if (u == "XX") return "FAIL"
-    if (u == "--") return "INFO"
+    if (u == "OK") return "OK"
+    if (u == "!!") return "Warning"
+    if (u == "XX") return "Fail"
+    if (u == "--") return "Info"
+    if (u == "@OFF") return "Disabled"
     return u
 }
-function pill(st) { return "<span class=\"pill " sevclass(st) "\">" esc(stlabel(st)) "</span>" }
+function badge(st,  c) {
+    if (st == "") return ""
+    c = (st == "@OFF") ? "" : sevclass(st)
+    if (c == "info") c = ""
+    return "<span class=\"badge" (c == "" ? "" : " " c) "\">" esc(stlabel(st)) "</span>"
+}
+# "303s" -> 303, anything else -> -1
+function secs(x) { return (x ~ /^[0-9]+s$/) ? x + 0 : -1 }
+function two(n) { return (n < 10) ? "0" n : n }
+function fmt_lag(x,  n, h, m) {
+    if (x == "") return "&mdash;"
+    if (x == "(unknown)") x = "unknown"
+    n = secs(x)
+    if (n < 0) return esc(x)
+    if (n < 60) return n "s"
+    if (n < 3600) { m = int(n / 60); return m "m " two(n - m * 60) "s" }
+    h = int(n / 3600); m = int((n - h * 3600) / 60)
+    return h "h " two(m) "m"
+}
+# Which of two lag/ping values to highlight on a degraded row: 1, 2 or 0.
+function worse(a, b,  x, y) {
+    x = secs(a); y = secs(b)
+    if (a != "" && x < 0) return 1
+    if (b != "" && y < 0) return 2
+    if (x <= 0 && y <= 0) return 0
+    return (x >= y) ? 1 : 2
+}
+function cell(v, hot, sev, raw) { return "<td class=\"num" (hot ? " v-" sev : "") "\">" (raw && v != "" ? esc(v == "(unknown)" ? "unknown" : v) : fmt_lag(v)) "</td>" }
 function add_finding(sev, text) {
     nf++; F_SEV[nf] = sev; F_TXT[nf] = text
     if (sev == "crit") ncrit++
@@ -57,7 +93,7 @@ function open_section(title) {
     findsec = (title == "TOP FINDINGS" || title == "FINAL SUMMARY")
     logsec = (title ~ /EVENTS/ || title ~ /ALERT LOG/)
     if (findsec) return
-    out = out "<section class=\"sec\"><h3>" esc(title) "</h3>"
+    out = out "<section class=\"sec\"><h4>" esc(title) "</h4>"
     insec = 1
 }
 function close_section() {
@@ -70,6 +106,91 @@ function open_table() { close_log(); if (!intable) { out = out "<table class=\"k
 function close_table() { flush_row(); if (intable) out = out "</table>"; intable = 0 }
 function open_log() { close_table(); if (!inlog) { out = out "<div class=\"log\">"; inlog = 1 } }
 function close_log() { if (inlog) out = out "</div>"; inlog = 0 }
+# "name: rest" -> NM, REST
+function split_name(v,  k) {
+    k = index(v, ": ")
+    if (k > 0) { NM = substr(v, 1, k - 1); REST = substr(v, k + 2) } else { NM = v; REST = "" }
+}
+function add_db(name, role, state, t, a, st,  sev, w) {
+    sev = (st == "" || st == "@OFF") ? "none" : sevclass(st)
+    w = (sev == "warn" || sev == "crit") ? worse(t, a) : 0
+    ndb++
+    DB[ndb] = "<tr class=\"r-" sev "\"><td class=\"mono" (st == "@OFF" ? " muted" : "") "\">" esc(name) "</td><td>" esc(role) "</td><td>" (state == "" ? "<span class=\"muted\">&mdash;</span>" : esc(state)) "</td>" \
+        cell(t, w == 1, sev) cell(a, w == 2, sev) "<td>" badge(st) "</td></tr>"
+}
+# The --check component rows. Returns 1 when the row was taken.
+function comp_row(  v, sev, role, state, t, a, k, n, parts, j, head, host, pp, pt, name, w) {
+    v = P_VAL
+    sev = (P_ST == "") ? "none" : sevclass(P_ST)
+    if (P_LAB == "Primary") {
+        split_name(v); add_db(NM, "Primary", REST, "", "", P_ST); return 1
+    }
+    if (P_LAB == "Standby") {
+        split_name(v); role = "Standby"
+        if (NM ~ / \(local\)$/) { sub(/ \(local\)$/, "", NM); role = "Standby (checked host)" }
+        if (REST == "disabled in the broker") { add_db(NM, role, "disabled in the broker", "", "", "@OFF"); return 1 }
+        state = REST; t = ""; a = ""
+        k = index(REST, ", transport ")
+        if (k > 0) {
+            state = substr(REST, 1, k - 1); t = substr(REST, k + 12)
+            k = index(t, ", apply ")
+            if (k > 0) { a = substr(t, k + 8); t = substr(t, 1, k - 1) }
+            k = index(a, ", ")
+            if (k > 0) { state = state substr(a, k); a = substr(a, 1, k - 1) }
+        } else if ((k = index(REST, " / ")) > 0) {
+            state = ""; t = substr(REST, 1, k - 1); a = substr(REST, k + 3)
+        }
+        add_db(NM, role, state, t, a, P_ST)
+        nsb++
+        if (sev == "ok") nsbok++
+        if (secs(a) >= 0 && (maxlag == "" || secs(a) > secs(maxlag))) { maxlag = a; maxsev = sev }
+        else if (a != "" && secs(a) < 0 && maxlag == "") { maxlag = a; maxsev = sev }
+        return 1
+    }
+    if (P_LAB == "FSFO") {
+        n = split(v, parts, ", ")
+        if (n >= 2 && parts[2] ~ /^target /) {
+            fsfo = 1
+            KV = KV kvitem("Fast-start failover", parts[1])
+            KV = KV kvitem("Failover target", substr(parts[2], 8))
+            state = ""
+            for (j = 3; j <= n; j++) state = state (state == "" ? "" : ", ") parts[j]
+            if (state != "") KV = KV kvitem("FSFO status", state, sev)
+        } else {
+            fsfo = 0
+            KV = KV kvitem("Fast-start failover", v)
+        }
+        return 1
+    }
+    if (P_LAB == "Observer") {
+        nobs++
+        if (sev == "ok") nobsok++
+        k = index(v, " @ ")
+        if (k > 0 && match(v, /: last ping primary /)) {
+            head = substr(v, 1, k - 1); host = substr(v, k + 3, RSTART - k - 3)
+            pp = substr(v, RSTART + RLENGTH); pt = ""
+            j = index(pp, ", target ")
+            if (j > 0) { pt = substr(pp, j + 9); pp = substr(pp, 1, j - 1) }
+            name = head; role = ""
+            j = index(head, " (")
+            if (j > 0) { name = substr(head, 1, j - 1); role = substr(head, j + 2); sub(/\)$/, "", role) }
+            w = (sev == "warn" || sev == "crit") ? worse(pp, pt) : 0
+            OB[nobs] = "<tr class=\"r-" sev "\"><td class=\"mono\">" esc(name) "</td><td>" esc(role) "</td><td>" esc(host) "</td>" \
+                cell(pp, w == 1, sev, 1) cell(pt, w == 2, sev, 1) "<td>" badge(P_ST) "</td></tr>"
+        } else {
+            OB[nobs] = "<tr class=\"r-" sev "\"><td colspan=\"5\">" esc(v) "</td><td>" badge(P_ST) "</td></tr>"
+        }
+        return 1
+    }
+    if (P_LAB == "Broker") {
+        KV = KV kvitem("Broker", v, sev)
+        return 1
+    }
+    return 0
+}
+function kvitem(label, value, sev) {
+    return "<span>" esc(label) " <b" ((sev == "warn" || sev == "crit") ? " class=\"v-" sev "\"" : "") ">" esc(value) "</b></span>"
+}
 function flush_row(  sev, c) {
     if (!havepend) return
     havepend = 0
@@ -87,9 +208,11 @@ function flush_row(  sev, c) {
         if (sev != "") { add_finding(sev, P_VAL); return }
         if (findsec) return
     }
+    if (check && comp_row()) return
+    ensure_section()
     open_table()
     sev = (P_ST == "") ? "none" : sevclass(P_ST)
-    out = out "<tr class=\"r-" sev "\"><th>" esc(P_LAB) "</th><td>" esc(P_VAL) "</td><td>" (P_ST == "" ? "" : pill(P_ST)) "</td></tr>"
+    out = out "<tr class=\"r-" sev "\"><th>" esc(P_LAB) "</th><td>" esc(P_VAL) "</td><td>" badge(P_ST) "</td></tr>"
 }
 function misc_line(s) {
     s = trim(s)
@@ -98,13 +221,22 @@ function misc_line(s) {
     misc = misc esc(s) "\n"
     if (first_misc == "") first_misc = s
 }
+# "Label: value" -> kv item, anything else -> bold text
+function kvpiece(s,  k) {
+    s = trim(s)
+    if (s == "") return ""
+    k = index(s, ": ")
+    if (k > 0 && substr(s, 1, k - 1) ~ /^[A-Za-z][A-Za-z ]*$/) return kvitem(substr(s, 1, k - 1), substr(s, k + 2))
+    return "<span><b>" esc(s) "</b></span>"
+}
 {
     sub(/\r$/, "")
     gsub("\033\\[[0-9;]*m", "")
     L[++n] = $0
 }
 END {
-    implicit = "Components"
+    check = (lw == 8)
+    implicit = check ? "Other" : "Components"
     for (i = 1; i <= n; i++) {
         s = L[i]
         if (s ~ /^[ \t]*$/) { if (inlog) out = out "<div class=\"gap\"></div>"; continue }
@@ -129,7 +261,7 @@ END {
             t = trim(s)
             cls = "ln"
             if (substr(s, 3, 1) != " ") cls = "lh"
-            else if (t ~ /^\(/ || t ~ /^\//) cls = "ln dim"
+            else if (t ~ /^\(/ || t ~ /^\//) cls = "ln muted"
             else if (tolower(t) ~ /ora-|error|fail/) cls = "ln bad"
             if (match(t, /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/))
                 t = "<time>" esc(substr(t, 1, 19)) "</time>" esc(trim(substr(t, 20)))
@@ -149,7 +281,7 @@ END {
             }
             val = trim(val)
             if (lab == "" && st == "" && havepend) { P_VAL = P_VAL " " val; continue }
-            flush_row(); ensure_section()
+            flush_row()
             havepend = 1; P_LAB = lab; P_VAL = val; P_ST = st
             continue
         }
@@ -157,31 +289,48 @@ END {
     }
     close_section()
 
-    if (title != "" || meta_line != "") {
-        printf "<div class=\"tmeta\">"
-        if (title != "") {
-            np = split(title, tp, "  ")
-            printf "<strong>%s</strong>", esc(trim(tp[1]))
-            for (j = 2; j <= np; j++) if (trim(tp[j]) != "") printf "<span class=\"chip\">%s</span>", esc(trim(tp[j]))
+    # Identity strip: title words, the Target/Local line, FSFO and broker.
+    head = ""
+    if (title != "") {
+        np = split(title, tp, "  ")
+        for (j = 1; j <= np; j++) {
+            t = trim(tp[j])
+            if (t == "") continue
+            if (j == 1) head = head "<span class=\"who\">" esc(t) "</span>"
+            else if (t ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/) head = head kvitem("At", t)
+            else if (check) head = head kvitem("State", t, (t ~ /^NOT /) ? "crit" : (t == "DEGRADED") ? "warn" : "")
+            else head = head "<span>" esc(t) "</span>"
         }
-        if (meta_line != "") {
-            np = split(meta_line, tp, "  [|]  ")
-            for (j = 1; j <= np; j++) printf "<span class=\"chip\">%s</span>", esc(trim(tp[j]))
-        }
-        printf "</div>\n"
     }
-    if (nf > 0) {
-        printf "<ul class=\"findings\">\n"
+    if (meta_line != "") {
+        np = split(meta_line, tp, "  [|]  ")
+        for (j = 1; j <= np; j++) head = head kvpiece(tp[j])
+    }
+    head = head KV
+    if (head != "") printf "<div class=\"kvline\">%s</div>\n", head
+    if (!check && nf > 0) {
+        printf "<ul class=\"tfind\">\n"
         for (pass = 1; pass <= 3; pass++) {
             want = (pass == 1) ? "crit" : (pass == 2) ? "warn" : "info"
             for (j = 1; j <= nf; j++) if (F_SEV[j] == want)
-                printf "<li class=\"f-%s\"><span class=\"pill %s\">%s</span><span>%s</span></li>\n", want, want, (want == "crit") ? "ERROR" : (want == "warn") ? "WARNING" : "INFO", esc(F_TXT[j])
+                printf "<li><span class=\"badge%s\">%s</span><span>%s</span></li>\n", (want == "info") ? "" : " " want, (want == "crit") ? "Error" : (want == "warn") ? "Warning" : "Info", esc(F_TXT[j])
         }
         printf "</ul>\n"
     }
     if (nmisc > 0) printf "<pre class=\"msgs\">%s</pre>\n", misc
+    if (ndb > 0) {
+        printf "<div><p class=\"subhead\">Databases</p><div class=\"subtable\"><table><thead><tr><th>Database</th><th>Role</th><th>State</th><th class=\"num\">Transport lag</th><th class=\"num\">Apply lag</th><th>Status</th></tr></thead><tbody>\n"
+        for (j = 1; j <= ndb; j++) printf "%s\n", DB[j]
+        printf "</tbody></table></div></div>\n"
+    }
+    if (nobs > 0) {
+        printf "<div><p class=\"subhead\">Observers</p><div class=\"subtable\"><table><thead><tr><th>Observer</th><th>Role</th><th>Host</th><th class=\"num\">Ping primary</th><th class=\"num\">Ping target</th><th>Status</th></tr></thead><tbody>\n"
+        for (j = 1; j <= nobs; j++) printf "%s\n", OB[j]
+        printf "</tbody></table></div></div>\n"
+    }
     if (out != "") printf "<div class=\"secs\">%s</div>\n", out
 
+    for (j = 1; j <= nf; j++) { t = F_TXT[j]; gsub(/\t/, " ", t); printf "%s\t%s\n", F_SEV[j], t > findf }
     first_sev = ""; first_txt = ""
     for (pass = 1; pass <= 2 && first_txt == ""; pass++) {
         want = (pass == 1) ? "crit" : "warn"
@@ -190,14 +339,18 @@ END {
     if (first_txt == "" && first_misc != "") { first_sev = "misc"; first_txt = first_misc }
     if (have_ov) { ncrit = ov_err; nwarn = ov_warn }
     gsub(/\t/, " ", first_txt)
-    printf "%d\t%d\t%d\t%s\t%s\n", ncrit, nwarn, ninfo, first_sev, first_txt > meta
+    if (check && ndb > 0) {
+        f_db = ndb; f_sb = nsb + 0; f_sbok = nsbok + 0; f_lag = (maxlag == "") ? "" : fmt_lag(maxlag); f_lsev = (maxlag == "") ? "" : maxsev
+        f_obs = nobs + 0; f_obsok = nobsok + 0; f_fsfo = (fsfo == "") ? "" : fsfo
+    } else { f_db = ""; f_sb = ""; f_sbok = ""; f_lag = ""; f_lsev = ""; f_obs = ""; f_obsok = ""; f_fsfo = "" }
+    printf "%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ncrit, nwarn, ninfo, nz(first_sev), nz(f_db), nz(f_sb), nz(f_sbok), nz(f_lag), nz(f_lsev), nz(f_obs), nz(f_obsok), nz(f_fsfo), first_txt > meta
 }
 AWKEOF
 )
-
-# $1 = report text file, $2 = label width, $3 = meta output file
+# $1 = report text file, $2 = label width, $3 = meta output file,
+# $4 = findings output file (optional)
 html_render_target_body() {
-    LC_ALL=C awk -v lw="$2" -v hc="─" -v meta="$3" "$DG_HTML_AWK" "$1"
+    LC_ALL=C awk -v lw="$2" -v hc="─" -v meta="$3" -v findf="${4:-/dev/null}" "$DG_HTML_AWK" "$1"
 }
 
 html_css() {
@@ -205,173 +358,178 @@ html_css() {
 *, *::before, *::after { box-sizing: border-box; min-width: 0; }
 :root {
   color-scheme: light dark;
-  --bg: light-dark(oklch(0.975 0.003 250), oklch(0.17 0.006 250));
-  --surface: light-dark(oklch(1 0 none), oklch(0.215 0.006 250));
-  --sunken: light-dark(oklch(0.965 0.003 250), oklch(0.19 0.006 250));
-  --fg: light-dark(oklch(0.24 0.01 250), oklch(0.93 0.005 250));
-  --muted: light-dark(oklch(0.52 0.01 250), oklch(0.7 0.01 250));
-  --line: light-dark(oklch(0.91 0.004 250), oklch(0.3 0.008 250));
-  --ok: light-dark(oklch(0.53 0.13 155), oklch(0.76 0.15 155));
-  --warn: light-dark(oklch(0.6 0.13 70), oklch(0.82 0.14 80));
-  --crit: light-dark(oklch(0.55 0.19 27), oklch(0.72 0.17 25));
-  --info: light-dark(oklch(0.53 0.1 250), oklch(0.76 0.1 250));
-  --radius: 0.75rem;
-  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
-  text-wrap: pretty;
-  overflow-wrap: break-word;
-  -webkit-text-size-adjust: 100%;
+  --background: #ffffff; --foreground: #09090b;
+  --card: #ffffff; --muted: #f4f4f5; --muted-foreground: #71717a;
+  --border: #e4e4e7; --ring: #a1a1aa;
+  --ok: #16a34a; --ok-bg: #f0fdf4; --ok-border: #bbf7d0; --ok-fg: #15803d;
+  --warn: #f59e0b; --warn-bg: #fffbeb; --warn-border: #fde68a; --warn-fg: #b45309;
+  --crit: #dc2626; --crit-bg: #fef2f2; --crit-border: #fecaca; --crit-fg: #b91c1c;
+  --none-bg: #f4f4f5; --none-border: #e4e4e7; --none-fg: #52525b;
+  --shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --radius: 0.625rem;
+  --sans: "Geist", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
-body {
-  margin: 0;
-  min-height: 100svh;
-  background: var(--bg);
-  color: var(--fg);
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  -webkit-font-smoothing: antialiased;
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #09090b; --foreground: #fafafa;
+    --card: #09090b; --muted: #18181b; --muted-foreground: #a1a1aa;
+    --border: #27272a; --ring: #52525b;
+    --ok: #22c55e; --ok-bg: rgb(34 197 94 / 0.1); --ok-border: rgb(34 197 94 / 0.25); --ok-fg: #4ade80;
+    --warn: #f59e0b; --warn-bg: rgb(245 158 11 / 0.1); --warn-border: rgb(245 158 11 / 0.25); --warn-fg: #fbbf24;
+    --crit: #ef4444; --crit-bg: rgb(239 68 68 / 0.1); --crit-border: rgb(239 68 68 / 0.3); --crit-fg: #f87171;
+    --none-bg: #18181b; --none-border: #27272a; --none-fg: #a1a1aa;
+    --shadow: none;
+  }
 }
-h1, h2, h3 { text-wrap: balance; margin: 0; }
-:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; border-radius: 4px; }
-.wrap { max-inline-size: 78rem; margin-inline: auto; padding: clamp(1rem, 0.4rem + 2.4vw, 2.75rem); }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--background); color: var(--foreground); font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+a { color: inherit; text-decoration: none; }
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 6px; }
+.container { max-inline-size: 72rem; margin-inline: auto; padding: 32px 24px 64px; display: grid; gap: 24px; }
+@media (max-width: 640px) { .container { padding: 20px 16px 48px; gap: 20px; } }
+.mono { font-family: var(--mono); font-size: 13px; }
+.muted { color: var(--muted-foreground); }
+svg.i { inline-size: 16px; block-size: 16px; flex: none; }
 
-header.top { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 0.75rem 2rem; margin-block-end: 1.5rem; }
-.eyebrow { color: var(--muted); font-size: 0.85rem; font-weight: 500; display: flex; align-items: center; gap: 0.5rem; }
-.eyebrow svg { flex: none; inline-size: 1.1em; block-size: 1.1em; }
-h1 { font-size: clamp(1.5rem, 1.1rem + 1.6vw, 2.25rem); line-height: 1.15; font-weight: 650; letter-spacing: -0.015em; margin-block-start: 0.25rem; }
-.runmeta { display: flex; flex-wrap: wrap; gap: 0.25rem 1.25rem; color: var(--muted); font-size: 0.85rem; }
-.runmeta b { color: var(--fg); font-weight: 550; }
+.page-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 12px 24px; }
+h1 { font-size: 24px; line-height: 32px; font-weight: 600; letter-spacing: -0.025em; margin: 0; }
+.page-head p { margin: 4px 0 0; color: var(--muted-foreground); }
+.meta { display: flex; flex-wrap: wrap; gap: 8px; }
 
-.verdict {
-  --c: var(--ok);
-  display: flex; align-items: center; gap: 1rem;
-  padding: 1rem 1.25rem; border-radius: var(--radius);
-  background: color-mix(in oklch, var(--c) 10%, var(--surface));
-  border: 1px solid color-mix(in oklch, var(--c) 30%, transparent);
-  margin-block-end: 1rem;
-}
-.verdict.warn { --c: var(--warn); }
-.verdict.crit { --c: var(--crit); }
-.verdict .dot { flex: none; inline-size: 0.8rem; block-size: 0.8rem; border-radius: 50%; background: var(--c); box-shadow: 0 0 0 0.3rem color-mix(in oklch, var(--c) 22%, transparent); }
-.verdict strong { font-size: 1.1rem; font-weight: 650; }
-.verdict span { color: var(--muted); }
+.badge { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--none-border); background: var(--none-bg); color: var(--none-fg); border-radius: 6px; padding: 2px 8px; font-size: 12px; font-weight: 500; line-height: 16px; white-space: nowrap; }
+.badge .dot { inline-size: 6px; block-size: 6px; border-radius: 50%; background: currentColor; }
+.badge.ok { background: var(--ok-bg); border-color: var(--ok-border); color: var(--ok-fg); }
+.badge.warn { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-fg); }
+.badge.crit, .badge.fail { background: var(--crit-bg); border-color: var(--crit-border); color: var(--crit-fg); }
+.badge.outline { background: transparent; border-color: var(--border); color: var(--foreground); }
 
-.stats { display: grid; gap: 0.75rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); margin-block-end: 1.75rem; }
-.stat { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 0.85rem 1rem; }
-.stat .n { font-size: 1.9rem; font-weight: 650; line-height: 1.1; font-variant-numeric: tabular-nums; }
-.stat .l { color: var(--muted); font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; }
-.stat .l i { inline-size: 0.55rem; block-size: 0.55rem; border-radius: 50%; background: var(--muted); flex: none; }
-.stat.ok .l i { background: var(--ok); } .stat.warn .l i { background: var(--warn); }
-.stat.crit .l i { background: var(--crit); } .stat.fail .l i { background: var(--crit); }
-.stat.zero .n { color: var(--muted); font-weight: 500; }
+.alert { --a-bg: var(--crit-bg); --a-border: var(--crit-border); --a-fg: var(--crit-fg);
+  display: grid; grid-template-columns: 16px 1fr; gap: 2px 12px; padding: 14px 16px; border: 1px solid var(--a-border); border-radius: var(--radius); background: var(--a-bg); color: var(--a-fg); }
+.alert.warn { --a-bg: var(--warn-bg); --a-border: var(--warn-border); --a-fg: var(--warn-fg); }
+.alert.ok { --a-bg: var(--ok-bg); --a-border: var(--ok-border); --a-fg: var(--ok-fg); }
+.alert svg { margin-block-start: 2px; }
+.alert h2 { font-size: 14px; font-weight: 600; margin: 0; line-height: 20px; }
+.alert p { grid-column: 2; margin: 0; font-size: 14px; color: color-mix(in srgb, var(--a-fg) 85%, var(--foreground)); }
 
-h2 { font-size: 1.05rem; font-weight: 650; }
-.bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem; margin-block: 0 0.75rem; }
-.controls { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-.controls button {
-  font: inherit; font-size: 0.85rem; color: var(--fg); cursor: pointer;
-  background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 0.3rem 0.85rem;
-  user-select: none; -webkit-user-select: none; touch-action: manipulation;
-}
-.controls button[aria-pressed="true"] { background: var(--fg); color: var(--surface); border-color: var(--fg); }
-.controls button:active { transform: scale(0.97); }
-@media (hover: hover) and (pointer: fine) {
-  .controls button:hover { border-color: color-mix(in oklch, var(--fg) 40%, var(--line)); }
-  table.fleet tbody tr:hover { background: var(--sunken); }
-}
-@media (prefers-reduced-motion: no-preference) {
-  .controls button { transition: transform 160ms var(--ease-out); }
-}
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+.card-head { padding: 20px 24px 0; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.card-head h3 { font-size: 16px; font-weight: 600; line-height: 24px; margin: 0; letter-spacing: -0.01em; }
+.card-head p { margin: 2px 0 0; color: var(--muted-foreground); font-size: 14px; }
+.card-body { padding: 16px 24px 24px; }
+.card-body.flush { padding: 16px 0 8px; }
+@media (max-width: 640px) { .card-head { padding: 16px 16px 0; } .card-body { padding: 12px 16px 16px; } .card-body.flush { padding: 12px 0 4px; } }
 
-.tablebox { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow-x: auto; margin-block-end: 2rem; }
-table.fleet { inline-size: 100%; border-collapse: collapse; font-size: 0.9rem; }
-table.fleet th { text-align: start; font-weight: 550; color: var(--muted); font-size: 0.8rem; padding: 0.6rem 0.9rem; border-block-end: 1px solid var(--line); white-space: nowrap; }
-table.fleet td { padding: 0.6rem 0.9rem; border-block-end: 1px solid var(--line); vertical-align: top; }
-table.fleet tbody tr:last-child td { border-block-end: 0; }
-table.fleet td.num { text-align: end; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted); }
-table.fleet td.name a { color: var(--fg); font-weight: 600; text-decoration: none; }
-table.fleet td.name a:focus-visible { outline-offset: 2px; }
-table.fleet td.method { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); }
-table.fleet td.key { color: var(--muted); max-inline-size: 34rem; }
-table.fleet td.key .t { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: clip; }
-.cnt { display: inline-flex; gap: 0.35rem; font-variant-numeric: tabular-nums; font-size: 0.8rem; white-space: nowrap; }
-.cnt b { font-weight: 600; } .cnt .e { color: var(--crit); } .cnt .w { color: var(--warn); }
+.stats { display: grid; gap: 16px; grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 860px) { .stats { grid-template-columns: repeat(2, 1fr); gap: 12px; } }
+.stat { padding: 20px 24px; }
+.stat .top { display: flex; justify-content: space-between; align-items: center; font-size: 14px; font-weight: 500; }
+.stat .top svg { color: var(--muted-foreground); }
+.stat .val { font-size: 24px; line-height: 32px; font-weight: 700; margin-block-start: 6px; font-variant-numeric: tabular-nums; }
+.stat .sub { font-size: 12px; color: var(--muted-foreground); }
+.stat.ok .top svg { color: var(--ok); } .stat.warn .top svg { color: var(--warn); } .stat.crit .top svg { color: var(--crit); }
+.stat.zero .val { color: var(--muted-foreground); }
+@media (max-width: 640px) { .stat { padding: 16px; } }
 
-.pill {
-  --c: var(--info);
-  display: inline-block; white-space: nowrap;
-  font-size: 0.72rem; font-weight: 650; letter-spacing: 0.02em; line-height: 1;
-  padding: 0.3rem 0.5rem; border-radius: 999px;
-  color: var(--c); background: color-mix(in oklch, var(--c) 13%, transparent);
-  border: 1px solid color-mix(in oklch, var(--c) 28%, transparent);
-}
-.pill.ok { --c: var(--ok); } .pill.warn { --c: var(--warn); } .pill.crit { --c: var(--crit); } .pill.fail { --c: var(--crit); }
-.pill.fail { color: var(--surface); background: var(--crit); }
-.pill.lg { font-size: 0.8rem; padding: 0.38rem 0.65rem; }
-.why { display: block; color: var(--muted); font-size: 0.75rem; margin-block-start: 0.25rem; white-space: nowrap; }
+.toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: center; margin-block-end: 12px; }
+.toolbar h3 { margin: 0; font-size: 16px; font-weight: 600; }
+.tabs { display: inline-flex; background: var(--muted); border-radius: 8px; padding: 3px; }
+.tabs button { font: 500 14px var(--sans); color: var(--muted-foreground); background: none; border: 0; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+.tabs button[aria-selected="true"] { background: var(--background); color: var(--foreground); box-shadow: 0 1px 3px rgb(0 0 0 / 0.1); }
+.btns { display: flex; gap: 8px; }
+.btn { font: 500 14px var(--sans); display: inline-flex; align-items: center; gap: 8px; color: var(--foreground); background: var(--background); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; cursor: pointer; box-shadow: var(--shadow); }
+.btn:hover { background: var(--muted); }
 
-details.target { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); margin-block-end: 0.85rem; scroll-margin-block-start: 1rem; }
-details.target > summary {
-  list-style: none; cursor: pointer; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.9rem;
-  padding: 0.9rem 1.1rem; border-radius: var(--radius);
-}
-details.target > summary::-webkit-details-marker { display: none; }
-details.target > summary::before {
-  content: ""; flex: none; inline-size: 0.5rem; block-size: 0.5rem;
-  border-inline-end: 2px solid var(--muted); border-block-end: 2px solid var(--muted);
-  transform: rotate(-45deg); margin-inline-end: 0.15rem;
-}
-details.target[open] > summary::before { transform: rotate(45deg); }
-@media (prefers-reduced-motion: no-preference) {
-  details.target > summary::before { transition: transform 200ms var(--ease-out); }
-}
-details.target[open] > summary { border-block-end: 1px solid var(--line); border-end-start-radius: 0; border-end-end-radius: 0; }
-details.target > summary .tname { font-weight: 650; font-size: 1.02rem; }
-details.target > summary .tm { color: var(--muted); font-family: var(--mono); font-size: 0.8rem; }
-details.target > summary .push { margin-inline-start: auto; display: flex; gap: 0.9rem; align-items: center; color: var(--muted); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
-.tbody { padding: 1rem 1.1rem 1.1rem; display: grid; gap: 1rem; }
-.tmeta { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
-.tmeta strong { margin-inline-end: 0.35rem; }
-.chip { font-size: 0.78rem; color: var(--muted); background: var(--sunken); border: 1px solid var(--line); border-radius: 0.4rem; padding: 0.12rem 0.5rem; }
+.table-wrap { overflow-x: auto; }
+table { inline-size: 100%; border-collapse: collapse; font-size: 14px; }
+th { text-align: start; font-weight: 500; color: var(--muted-foreground); padding: 0 12px; block-size: 40px; white-space: nowrap; border-block-end: 1px solid var(--border); }
+td { padding: 12px; border-block-end: 1px solid var(--border); vertical-align: middle; }
+tbody tr:last-child td { border-block-end: 0; }
+td.num, th.num { text-align: end; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.fleet th:first-child, .fleet td:first-child { padding-inline-start: 24px; }
+.fleet th:last-child, .fleet td:last-child { padding-inline-end: 24px; }
+.fleet tbody tr { cursor: pointer; }
+.fleet tbody tr:hover { background: color-mix(in srgb, var(--muted) 60%, transparent); }
+.fleet .tname { font-weight: 500; }
+.fleet .tsub { font-size: 12px; color: var(--muted-foreground); }
+.fleet td.key { color: var(--muted-foreground); max-inline-size: 26rem; }
+.fleet td.key span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.v-warn { color: var(--warn-fg); font-weight: 500; }
+.v-crit { color: var(--crit-fg); font-weight: 500; }
+@media (max-width: 760px) { .fleet .hide-sm { display: none; } .fleet th:first-child, .fleet td:first-child { padding-inline-start: 16px; } .fleet th:last-child, .fleet td:last-child { padding-inline-end: 16px; } }
 
-ul.findings { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 0.6rem; overflow: clip; }
-ul.findings li { display: flex; gap: 0.75rem; align-items: baseline; padding: 0.55rem 0.8rem; border-block-end: 1px solid var(--line); }
-ul.findings li:last-child { border-block-end: 0; }
-ul.findings li .pill { flex: none; inline-size: 5.6rem; text-align: center; }
-ul.findings li.f-crit { background: color-mix(in oklch, var(--crit) 6%, transparent); }
-ul.findings li.f-warn { background: color-mix(in oklch, var(--warn) 6%, transparent); }
-ul.findings li.f-info { color: var(--muted); }
+.findings { list-style: none; margin: 0; padding: 0; }
+.findings li { display: grid; grid-template-columns: 84px minmax(64px, max-content) 1fr; gap: 12px; align-items: baseline; padding: 12px 0; border-block-end: 1px solid var(--border); }
+.findings li:first-child { padding-block-start: 0; }
+.findings li:last-child { border-block-end: 0; padding-block-end: 0; }
+.findings li .badge { justify-self: start; }
+.findings li .t { font-weight: 500; }
+.findings li .t:hover { text-decoration: underline; text-underline-offset: 3px; }
+.findings li p { margin: 0; overflow-wrap: anywhere; }
+.findings li p span { display: block; color: var(--muted-foreground); font-size: 13px; }
+@media (max-width: 560px) { .findings li { grid-template-columns: auto 1fr; } .findings li p { grid-column: 1 / -1; } }
+.empty { margin: 0; color: var(--muted-foreground); }
 
-pre.msgs, pre.raw { margin: 0; font: 0.8rem/1.5 var(--mono); background: var(--sunken); border: 1px solid var(--line); border-radius: 0.6rem; padding: 0.75rem 0.9rem; overflow-x: auto; white-space: pre; }
-pre.msgs { white-space: pre-wrap; border-color: color-mix(in oklch, var(--crit) 30%, var(--line)); }
+details.acc { overflow: clip; scroll-margin-block-start: 16px; }
+details.acc + details.acc { margin-block-start: 12px; }
+details.acc > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px 12px; padding: 16px 24px; flex-wrap: wrap; }
+details.acc > summary::-webkit-details-marker { display: none; }
+details.acc > summary .chev { color: var(--muted-foreground); transition: transform .2s; }
+details.acc[open] > summary .chev { transform: rotate(180deg); }
+details.acc > summary .name { font-weight: 600; font-size: 15px; }
+details.acc > summary .right { margin-inline-start: auto; display: flex; gap: 16px; align-items: center; color: var(--muted-foreground); font-size: 13px; font-variant-numeric: tabular-nums; }
+details.acc[open] > summary { border-block-end: 1px solid var(--border); }
+details.acc .inner { padding: 20px 24px 24px; display: grid; gap: 20px; }
+@media (max-width: 640px) { details.acc > summary { padding: 14px 16px; } details.acc .inner { padding: 16px; } }
+@media (prefers-reduced-motion: reduce) { details.acc > summary .chev { transition: none; } }
 
-.secs { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(min(100%, 27rem), 1fr)); align-items: start; }
-section.sec { border: 1px solid var(--line); border-radius: 0.6rem; overflow: clip; }
-section.sec h3 { font-size: 0.8rem; font-weight: 650; letter-spacing: 0.03em; color: var(--muted); padding: 0.5rem 0.8rem; background: var(--sunken); border-block-end: 1px solid var(--line); }
-table.kv { inline-size: 100%; border-collapse: collapse; font-size: 0.85rem; }
-table.kv th { text-align: start; font-weight: 500; color: var(--muted); padding: 0.38rem 0.8rem; inline-size: 38%; vertical-align: top; }
-table.kv td { padding: 0.38rem 0.8rem; font-family: var(--mono); font-size: 0.8rem; vertical-align: top; }
-table.kv td:last-child { text-align: end; inline-size: 1%; white-space: nowrap; padding-inline-start: 0; }
-table.kv tr + tr > * { border-block-start: 1px solid color-mix(in oklch, var(--line) 60%, transparent); }
-table.kv tr.r-crit { background: color-mix(in oklch, var(--crit) 6%, transparent); }
-table.kv tr.r-warn { background: color-mix(in oklch, var(--warn) 6%, transparent); }
-table.kv tr.sub { background: var(--sunken); }
-table.kv tr.sub th { inline-size: auto; color: var(--fg); font-weight: 600; font-size: 0.78rem; padding-block-start: 0.65rem; }
-.log { padding: 0.5rem 0.8rem; font: 0.78rem/1.55 var(--mono); }
-.log .lh { font-family: system-ui, sans-serif; font-size: 0.82rem; font-weight: 600; margin-block-start: 0.25rem; }
-.log .ln { padding-inline-start: 0.75rem; white-space: pre-wrap; }
-.log .dim { color: var(--muted); }
-.log .bad { color: var(--crit); }
-.log time { color: var(--muted); margin-inline-end: 0.75rem; }
-.log .gap { block-size: 0.4rem; }
-details.rawbox > summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; inline-size: fit-content; }
-details.rawbox[open] > summary { margin-block-end: 0.5rem; }
+.kvline { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; color: var(--muted-foreground); }
+.kvline b { font-weight: 500; color: var(--foreground); }
+.kvline b.v-warn { color: var(--warn-fg); } .kvline b.v-crit { color: var(--crit-fg); }
+.kvline .who { color: var(--foreground); font-weight: 600; }
+.subhead { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
+.subtable { border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; }
+.subtable th { block-size: 36px; background: var(--muted); font-size: 13px; }
+.subtable td { padding-block: 10px; }
+.subtable th:first-child, .subtable td:first-child { padding-inline-start: 12px; }
+.subtable th:last-child, .subtable td:last-child { padding-inline-end: 12px; }
 
-body.problems-only .is-ok { display: none; }
-footer { color: var(--muted); font-size: 0.8rem; margin-block-start: 2rem; padding-block-start: 1rem; border-block-start: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 0.25rem 1.5rem; }
+ul.tfind { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+ul.tfind li { display: flex; gap: 12px; align-items: baseline; padding: 10px 12px; border-block-end: 1px solid var(--border); }
+ul.tfind li:last-child { border-block-end: 0; }
+ul.tfind li .badge { flex: none; min-inline-size: 64px; justify-content: center; }
+
+.secs { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 26rem), 1fr)); align-items: start; }
+section.sec { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+section.sec h4 { margin: 0; font-size: 13px; font-weight: 600; padding: 8px 12px; background: var(--muted); border-block-end: 1px solid var(--border); }
+table.kv { font-size: 13px; }
+table.kv th { block-size: auto; padding: 8px 12px; font-weight: 400; inline-size: 38%; vertical-align: top; white-space: normal; border-block-end: 1px solid var(--border); }
+table.kv td { padding: 8px 12px; vertical-align: top; overflow-wrap: anywhere; }
+table.kv td:last-child { inline-size: 1%; text-align: end; white-space: nowrap; padding-inline-start: 0; }
+table.kv tr:last-child > * { border-block-end: 0; }
+table.kv tr.sub th { background: var(--muted); color: var(--foreground); font-weight: 600; }
+table.kv tr.r-crit td:nth-child(2) { color: var(--crit-fg); }
+table.kv tr.r-warn td:nth-child(2) { color: var(--warn-fg); }
+.log { padding: 8px 12px; font: 12.5px/1.6 var(--mono); }
+.log .lh { font-family: var(--sans); font-size: 13px; font-weight: 600; margin-block-start: 4px; }
+.log .ln { padding-inline-start: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.log .bad { color: var(--crit-fg); }
+.log time { color: var(--muted-foreground); margin-inline-end: 12px; }
+.log .gap { block-size: 6px; }
+
+.error-box { border: 1px solid var(--crit-border); background: var(--crit-bg); color: var(--crit-fg); border-radius: 8px; padding: 12px 16px; }
+.error-box p { margin: 0; font-weight: 500; }
+pre.msgs { margin: 0; padding: 12px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--muted); font: 12.5px/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+details.raw > summary { cursor: pointer; color: var(--muted-foreground); font-size: 13px; font-weight: 500; inline-size: fit-content; display: inline-flex; gap: 6px; align-items: center; }
+details.raw > summary::-webkit-details-marker { display: none; }
+details.raw[open] > summary svg { transform: rotate(90deg); }
+details.raw pre { margin: 10px 0 0; padding: 14px 16px; background: var(--muted); border-radius: 8px; font: 12.5px/1.6 var(--mono); overflow-x: auto; }
+
+body.attn .is-ok { display: none; }
+footer { color: var(--muted-foreground); font-size: 13px; border-block-start: 1px solid var(--border); padding-block-start: 16px; display: flex; flex-wrap: wrap; gap: 4px 24px; }
 @media print {
-  .controls { display: none; }
-  body { background: white; }
-  details.target, .tablebox, .stat { break-inside: avoid; }
+  .tabs, .btns { display: none; }
+  details.acc, .card { break-inside: avoid; box-shadow: none; }
 }
 CSS
 }
@@ -380,27 +538,30 @@ html_js() {
     cat <<'JS'
 (function () {
   var body = document.body;
-  function press(group, btn) {
-    var bs = document.querySelectorAll('[data-group="' + group + '"]');
-    for (var i = 0; i < bs.length; i++) bs[i].setAttribute('aria-pressed', bs[i] === btn ? 'true' : 'false');
+  function open(sel, scroll) {
+    var d = document.querySelector(sel);
+    if (!d) return;
+    d.open = true;
+    if (scroll) d.scrollIntoView({ block: 'start' });
   }
   document.addEventListener('click', function (ev) {
-    var b = ev.target.closest('button[data-act]');
-    if (!b) return;
-    var act = b.getAttribute('data-act');
-    if (act === 'all' || act === 'problems') {
-      body.classList.toggle('problems-only', act === 'problems');
-      press('filter', b);
-    } else if (act === 'expand' || act === 'collapse') {
-      var ds = document.querySelectorAll('details.target');
-      for (var i = 0; i < ds.length; i++) ds[i].open = act === 'expand';
+    var t = ev.target.closest('button[data-f]');
+    if (t) {
+      body.classList.toggle('attn', t.getAttribute('data-f') === 'attn');
+      var bs = t.parentNode.querySelectorAll('button');
+      for (var i = 0; i < bs.length; i++) bs[i].setAttribute('aria-selected', bs[i] === t ? 'true' : 'false');
+      return;
     }
-  });
-  document.addEventListener('click', function (ev) {
+    var x = ev.target.closest('button[data-x]');
+    if (x) {
+      var ds = document.querySelectorAll('details.acc');
+      for (var j = 0; j < ds.length; j++) ds[j].open = x.getAttribute('data-x') === '1';
+      return;
+    }
     var a = ev.target.closest('a[href^="#t"]');
-    if (!a) return;
-    var d = document.getElementById(a.getAttribute('href').slice(1));
-    if (d) d.open = true;
+    if (a) { open(a.getAttribute('href'), false); return; }
+    var r = ev.target.closest('tr[data-href]');
+    if (r) open(r.getAttribute('data-href'), true);
   });
   window.addEventListener('beforeprint', function () {
     var ds = document.querySelectorAll('details');
@@ -410,33 +571,56 @@ html_js() {
 JS
 }
 
-# rc -> "class<TAB>label<TAB>detail" for a target's result pill.
+# Inline icons (24x24 stroke paths).
+html_icon() {
+    local p
+    case "$1" in
+        alert)  p='<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/>' ;;
+        check)  p='<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>' ;;
+        warn)   p='<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>' ;;
+        x)      p='<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/>' ;;
+        db)     p='<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>' ;;
+        down)   p='<path d="m6 9 6 6 6-6"/>' ;;
+        right)  p='<path d="m9 18 6-6-6-6"/>' ;;
+    esac
+    printf '<svg class="i%s" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">%s</svg>' "${2:+ $2}" "$p"
+}
+
+# rc -> "class<TAB>label<TAB>detail" for a target's result badge.
 html_result_of() {
     case "$1" in
-        0) printf 'ok\tOK\t' ;;
-        1) printf 'warn\tWARNING\t' ;;
-        2) printf 'crit\tCRITICAL\t' ;;
-        *) printf 'fail\tFAILED\t%s' "$(printf '%s' "$2" | sed 's/^FAILED *//; s/^(//; s/)$//')" ;;
+        0) printf 'ok\tHealthy\t' ;;
+        1) printf 'warn\tWarning\t' ;;
+        2) printf 'crit\tCritical\t' ;;
+        *) printf 'fail\tNot checked\t%s' "$(printf '%s' "$2" | sed 's/^FAILED *//; s/^(//; s/)$//')" ;;
     esac
 }
 
+# "n thing" / "n things"
+html_plural() { if [[ "$1" -eq 1 ]]; then printf '%s %s' "$1" "$2"; else printf '%s %ss' "$1" "$2"; fi; }
+
 # Writes the report from the wrapper's run state: NRUN, R_* (per result),
-# T_NAME, ALL_CHECK, WORST, CONFIG_FILE, RUN_STARTED, HTML_WORK (holds
-# out.<target index>). $1 = output file (written via a temp file + mv).
+# ALL_CHECK, WORST, CONFIG_FILE, RUN_STARTED, FLEET_TARGET_TIMEOUT, HTML_WORK
+# (holds out.<target index>). $1 = output file (written via a temp file + mv).
 html_write_report() {
-    local dest="$1" tmp="$1.tmp.$$" i idx lw cls label detail sev_e sev_w sev_i fsev ftxt
-    local n_ok=0 n_warn=0 n_crit=0 n_fail=0 vcls vhead vtext bad="" degraded="" open
-    local generated host html_mode html_any_check=false
+    local dest="$1" tmp="$1.tmp.$$" i k idx lw cls label detail open rank
+    local sev_e sev_w sev_i fsev ndb nsb nsbok mlag mlsev nobs nobsok fsfo ftxt
+    local n_ok=0 n_warn=0 n_crit=0 n_fail=0 n_attn vcls vhead vtext bad="" degraded=""
+    local generated host html_mode any_check=false any_review=false tot_db=0 tot_obs=0
+    local ORDER=() fsev_l ftext_l n_find=0 n_find_t=0 find_html="" seen=""
     generated="$(date '+%Y-%m-%d %H:%M:%S %Z')"
     host="$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')"
 
-    # Pass 1: render every card body and its meta line.
+    # Pass 1: render every detail body, its meta line and its findings.
     i=0
     while [[ $i -lt $NRUN ]]; do
         idx="${R_IDX[$i]}"
-        case "${R_MODE[$i]}" in */check) lw=8; html_any_check=true ;; *) lw=24 ;; esac
+        case "${R_MODE[$i]}" in */check) lw=8; any_check=true ;; *) lw=24; any_review=true ;; esac
         [[ -f "$HTML_WORK/out.$idx" ]] || : > "$HTML_WORK/out.$idx"
-        html_render_target_body "$HTML_WORK/out.$idx" "$lw" "$HTML_WORK/meta.$idx" > "$HTML_WORK/body.$idx" || return 1
+        html_render_target_body "$HTML_WORK/out.$idx" "$lw" "$HTML_WORK/meta.$idx" "$HTML_WORK/find.$idx" > "$HTML_WORK/body.$idx" || return 1
+        IFS=$'\t' read -r sev_e sev_w sev_i fsev ndb nsb nsbok mlag mlsev nobs nobsok fsfo ftxt < "$HTML_WORK/meta.$idx" || true
+        [[ "$ndb" =~ ^[0-9]+$ ]] && tot_db=$((tot_db + ndb))
+        [[ "$nobs" =~ ^[0-9]+$ ]] && tot_obs=$((tot_obs + nobs))
         case "${R_RC[$i]}" in
             0) n_ok=$((n_ok + 1)) ;;
             1) n_warn=$((n_warn + 1)); degraded="${degraded:+$degraded, }${R_NAME[$i]}" ;;
@@ -445,22 +629,57 @@ html_write_report() {
         esac
         i=$((i + 1))
     done
+    n_attn=$((NRUN - n_ok))
 
-    if $ALL_CHECK; then html_mode="check (running state)"
-    elif [[ "$html_any_check" == true ]]; then html_mode="mixed (check + review configuration)"
-    else html_mode="review configuration"; fi
+    # Worst first: critical and not checked, then warnings, then healthy;
+    # config order within a group.
+    for rank in 0 1 2; do
+        i=0
+        while [[ $i -lt $NRUN ]]; do
+            case "${R_RC[$i]}" in 0) k=2 ;; 1) k=1 ;; *) k=0 ;; esac
+            [[ $k -eq $rank ]] && ORDER+=("$i")
+            i=$((i + 1))
+        done
+    done
+
+    # Fleet-wide findings: failures and errors first, then warnings.
+    for rank in crit warn; do
+        for i in ${ORDER[@]+"${ORDER[@]}"}; do
+            idx="${R_IDX[$i]}"
+            if [[ "$rank" == crit ]]; then
+                case "${R_RC[$i]}" in 0|1|2) ;; *)
+                    IFS=$'\t' read -r cls label detail <<< "$(html_result_of "${R_RC[$i]}" "${R_PLAIN[$i]}")"
+                    IFS=$'\t' read -r sev_e sev_w sev_i fsev ndb nsb nsbok mlag mlsev nobs nobsok fsfo ftxt < "$HTML_WORK/meta.$idx" || true
+                    find_html="$find_html<li class=\"f-crit\"><span class=\"badge crit\">Failed</span><a class=\"t\" href=\"#t$idx\">$(html_esc_s "${R_NAME[$i]}")</a><p>$(html_esc_s "$detail")$([[ "$fsev" == misc ]] && printf '<span class="mono">%s</span>' "$(html_esc_s "$ftxt")")</p></li>"$'\n'
+                    n_find=$((n_find + 1)); seen="$seen $idx" ;;
+                esac
+            fi
+            [[ -s "$HTML_WORK/find.$idx" ]] || continue
+            while IFS=$'\t' read -r fsev_l ftext_l; do
+                [[ "$fsev_l" == "$rank" ]] || continue
+                find_html="$find_html<li><span class=\"badge $rank\">$([[ "$rank" == crit ]] && printf Error || printf Warning)</span><a class=\"t\" href=\"#t$idx\">$(html_esc_s "${R_NAME[$i]}")</a><p>$(html_esc_s "$ftext_l")</p></li>"$'\n'
+                n_find=$((n_find + 1))
+                case " $seen " in *" $idx "*) ;; *) seen="$seen $idx" ;; esac
+            done < "$HTML_WORK/find.$idx"
+        done
+    done
+    for k in $seen; do n_find_t=$((n_find_t + 1)); done
+
+    if $ALL_CHECK; then html_mode="running-state check"
+    elif [[ "$any_check" == true ]]; then html_mode="check and configuration review"
+    else html_mode="configuration review"; fi
     if [[ -n "$bad" ]]; then vcls="crit"; elif [[ -n "$degraded" ]]; then vcls="warn"; else vcls="ok"; fi
     if $ALL_CHECK; then
         case "$vcls" in
-            crit) vhead="Data Guard is NOT running correctly"; vtext="Problem or not checked: $bad${degraded:+ · degraded: $degraded}" ;;
+            crit) vhead="Data Guard is NOT running correctly on $((n_crit + n_fail)) of $NRUN target(s)"; vtext="Problem or not checked: $bad${degraded:+. Degraded: $degraded}" ;;
             warn) vhead="Data Guard is running but DEGRADED"; vtext="Degraded: $degraded" ;;
-            ok)   vhead="Data Guard is running as configured"; vtext="$NRUN target(s) checked" ;;
+            ok)   vhead="Data Guard is running as configured"; vtext="All $NRUN target(s) checked, no errors or warnings." ;;
         esac
     else
         case "$vcls" in
-            crit) vhead="Problems on $((n_crit + n_fail)) of $NRUN target(s)"; vtext="$bad${degraded:+ · warnings: $degraded}" ;;
+            crit) vhead="Problems on $((n_crit + n_fail)) of $NRUN target(s)"; vtext="$bad${degraded:+. Warnings: $degraded}" ;;
             warn) vhead="Warnings on $n_warn of $NRUN target(s)"; vtext="$degraded" ;;
-            ok)   vhead="All $NRUN target(s) healthy"; vtext="No errors or warnings" ;;
+            ok)   vhead="All $NRUN target(s) healthy"; vtext="No errors or warnings." ;;
         esac
     fi
 
@@ -468,81 +687,120 @@ html_write_report() {
         printf '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
         printf '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         printf '<meta name="color-scheme" content="light dark">\n'
-        printf '<title>DG fleet %s · %s</title>\n' "$(html_esc_s "$(basename "$CONFIG_FILE")")" "$(html_esc_s "$generated")"
-        printf '<style>\n'; html_css; printf '</style>\n</head>\n<body>\n<div class="wrap">\n'
+        printf '<title>Data Guard fleet report · %s · %s</title>\n' "$(html_esc_s "$(basename "$CONFIG_FILE")")" "$(html_esc_s "$generated")"
+        printf '<style>\n'; html_css; printf '</style>\n</head>\n<body>\n<div class="container">\n'
 
-        printf '<header class="top"><div>'
-        printf '<div class="eyebrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V5.5"/><path d="M4.5 12v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V12"/></svg>Data Guard fleet report</div>'
-        printf '<h1>%s</h1></div>' "$(html_esc_s "$(basename "$CONFIG_FILE")")"
-        printf '<div class="runmeta"><span>Mode <b>%s</b></span><span>Started <b>%s</b></span><span>Finished <b>%s</b></span><span>From <b>%s</b></span></div>' \
-            "$html_mode" \
-            "$(html_esc_s "$RUN_STARTED")" "$(html_esc_s "$generated")" "$(html_esc_s "$host")"
-        printf '</header>\n'
+        printf '<header class="page-head"><div><h1>Data Guard fleet report</h1>'
+        printf '<p>%s · %s · started %s, finished %s</p></div>' "$(html_esc_s "$(basename "$CONFIG_FILE")")" "$html_mode" "$(html_esc_s "$RUN_STARTED")" "$(date '+%H:%M:%S')"
+        printf '<div class="meta"><span class="badge outline">host %s</span><span class="badge outline">exit code %s</span></div></header>\n' \
+            "$(html_esc_s "$host")" "$WORST"
 
-        printf '<div class="verdict %s" role="status"><span class="dot"></span><div><strong>%s</strong><br><span>%s</span></div></div>\n' \
-            "$vcls" "$(html_esc_s "$vhead")" "$(html_esc_s "$vtext")"
+        printf '<div class="alert %s" role="%s">%s<h2>%s</h2><p>%s</p></div>\n' \
+            "$vcls" "$([[ "$vcls" == ok ]] && printf status || printf alert)" \
+            "$(case "$vcls" in ok) html_icon check ;; warn) html_icon warn ;; *) html_icon alert ;; esac)" \
+            "$(html_esc_s "$vhead")" "$(html_esc_s "$vtext")"
 
-        printf '<div class="stats">'
-        printf '<div class="stat"><div class="n">%s</div><div class="l"><i></i>Targets</div></div>' "$NRUN"
-        for cls in ok warn crit fail; do
-            case "$cls" in
-                ok) label="OK"; i=$n_ok ;; warn) label="Warning"; i=$n_warn ;;
-                crit) label="Critical"; i=$n_crit ;; fail) label="Not checked"; i=$n_fail ;;
-            esac
-            printf '<div class="stat %s%s"><div class="n">%s</div><div class="l"><i></i>%s</div></div>' "$cls" "$([[ $i -eq 0 ]] && printf ' zero')" "$i" "$label"
-        done
+        printf '<div class="stats">\n'
+        printf '<div class="card stat"><div class="top">Targets %s</div><div class="val">%s</div><div class="sub">%s</div></div>\n' \
+            "$(html_icon db)" "$NRUN" \
+            "$(if [[ "$any_check" == true ]]; then printf '%s, %s' "$(html_plural "$tot_db" database)" "$(html_plural "$tot_obs" observer)"; else printf '%s' "$html_mode"; fi)"
+        printf '<div class="card stat ok%s"><div class="top">Healthy %s</div><div class="val">%s</div><div class="sub">no errors or warnings</div></div>\n' \
+            "$([[ $n_ok -eq 0 ]] && printf ' zero')" "$(html_icon check)" "$n_ok"
+        printf '<div class="card stat warn%s"><div class="top">Warning %s</div><div class="val">%s</div><div class="sub">degraded, still running</div></div>\n' \
+            "$([[ $n_warn -eq 0 ]] && printf ' zero')" "$(html_icon warn)" "$n_warn"
+        printf '<div class="card stat crit%s"><div class="top">Critical %s</div><div class="val">%s</div><div class="sub">%s failing, %s not checked</div></div>\n' \
+            "$([[ $((n_crit + n_fail)) -eq 0 ]] && printf ' zero')" "$(html_icon x)" "$((n_crit + n_fail))" "$n_crit" "$n_fail"
         printf '</div>\n'
 
-        printf '<div class="bar"><h2>Targets</h2><div class="controls">'
-        printf '<button type="button" data-act="all" data-group="filter" aria-pressed="true">All</button>'
-        printf '<button type="button" data-act="problems" data-group="filter" aria-pressed="false">Needs attention</button>'
-        printf '<button type="button" data-act="expand">Expand all</button><button type="button" data-act="collapse">Collapse all</button>'
+        # Targets table
+        printf '<div class="card"><div class="card-head"><div><h3>Targets</h3><p>One row per target, worst first.</p></div>'
+        printf '<div class="tabs" role="tablist"><button type="button" role="tab" data-f="all" aria-selected="true">All (%s)</button><button type="button" role="tab" data-f="attn" aria-selected="false">Needs attention (%s)</button></div></div>\n' "$NRUN" "$n_attn"
+        printf '<div class="card-body flush"><div class="table-wrap"><table class="fleet"><thead><tr><th>Status</th><th>Target</th>'
+        [[ "$any_check" == true ]] && printf '<th class="hide-sm">Standbys</th><th class="hide-sm">Max apply lag</th><th class="hide-sm">Observers</th>'
+        [[ "$any_review" == true ]] && printf '<th class="hide-sm">Findings</th>'
+        printf '<th class="hide-sm">Key finding</th><th class="num">Time</th></tr></thead><tbody>\n'
+        for i in ${ORDER[@]+"${ORDER[@]}"}; do
+            idx="${R_IDX[$i]}"
+            IFS=$'\t' read -r cls label detail <<< "$(html_result_of "${R_RC[$i]}" "${R_PLAIN[$i]}")"
+            IFS=$'\t' read -r sev_e sev_w sev_i fsev ndb nsb nsbok mlag mlsev nobs nobsok fsfo ftxt < "$HTML_WORK/meta.$idx" || { sev_e=0; sev_w=0; ndb=-; ftxt=""; }
+            printf '<tr class="%s" data-href="#t%s"><td><span class="badge %s"><span class="dot"></span>%s</span></td>' \
+                "$([[ "$cls" == ok ]] && printf 'is-ok')" "$idx" "$cls" "$label"
+            printf '<td><a href="#t%s" class="tname">%s</a><div class="tsub">%s</div></td>' \
+                "$idx" "$(html_esc_s "${R_NAME[$i]}")" "$(html_esc_s "${R_METHOD[$i]}")"
+            if [[ "$any_check" == true ]]; then
+                if [[ "$ndb" == "-" || "$cls" == fail ]]; then
+                    printf '<td class="hide-sm muted">&mdash;</td><td class="hide-sm muted">&mdash;</td><td class="hide-sm muted">&mdash;</td>'
+                else
+                    printf '<td class="hide-sm%s">%s</td>' "$([[ "$nsb" != "$nsbok" ]] && printf ' v-warn')" \
+                        "$([[ "$nsb" == 0 ]] && printf 'none' || printf '%s / %s OK' "$nsbok" "$nsb")"
+                    printf '<td class="hide-sm%s">%s</td>' "$(case "$mlsev" in warn|crit) printf ' v-%s' "$mlsev" ;; esac)" \
+                        "$([[ "$mlag" == "-" ]] && printf '&mdash;' || printf '%s' "$mlag")"
+                    if [[ "$fsfo" == 0 && "$nobs" == 0 ]]; then
+                        printf '<td class="hide-sm muted">no FSFO</td>'
+                    else
+                        printf '<td class="hide-sm%s">%s / %s OK</td>' "$([[ "$nobs" != "$nobsok" ]] && printf ' v-crit')" "$nobsok" "$nobs"
+                    fi
+                fi
+            fi
+            if [[ "$any_review" == true ]]; then
+                if [[ "$cls" == fail || "${R_MODE[$i]}" == */check ]]; then
+                    printf '<td class="hide-sm muted">&mdash;</td>'
+                else
+                    printf '<td class="hide-sm"><span class="%s">%s</span>, <span class="%s">%s</span></td>' \
+                        "$([[ ${sev_e:-0} -gt 0 ]] && printf v-crit)" "$(html_plural "${sev_e:-0}" error)" \
+                        "$([[ ${sev_w:-0} -gt 0 ]] && printf v-warn)" "$(html_plural "${sev_w:-0}" warning)"
+                fi
+            fi
+            if [[ "$cls" == fail ]]; then
+                ftxt="$detail${ftxt:+: $ftxt}"
+            elif [[ "$cls" == ok ]]; then
+                ftxt=""
+            fi
+            printf '<td class="key hide-sm"><span>%s</span></td><td class="num">%ss</td></tr>\n' "$(html_esc_s "${ftxt:-—}")" "${R_SECS[$i]}"
+        done
+        printf '</tbody></table></div></div></div>\n'
+
+        # Findings
+        printf '<div class="card"><div class="card-head"><div><h3>Findings</h3><p>%s</p></div></div><div class="card-body">' \
+            "$(if [[ $n_find -gt 0 ]]; then printf '%s on %s, most serious first.' "$(html_plural "$n_find" finding)" "$(html_plural "$n_find_t" target)"; else printf 'Errors and warnings from every target.'; fi)"
+        if [[ $n_find -gt 0 ]]; then
+            printf '<ul class="findings">\n%s</ul>' "$find_html"
+        else
+            printf '<p class="empty">No errors or warnings.</p>'
+        fi
         printf '</div></div>\n'
 
-        printf '<div class="tablebox"><table class="fleet"><thead><tr><th>Result</th><th>Target</th><th>Method</th><th>Mode</th><th>Findings</th><th>Key finding</th><th class="num">Time</th></tr></thead><tbody>\n'
-        i=0
-        while [[ $i -lt $NRUN ]]; do
+        # Details
+        printf '<div><div class="toolbar"><h3>Details</h3><div class="btns"><button class="btn" type="button" data-x="1">Expand all</button><button class="btn" type="button" data-x="0">Collapse all</button></div></div>\n'
+        for i in ${ORDER[@]+"${ORDER[@]}"}; do
             idx="${R_IDX[$i]}"
             IFS=$'\t' read -r cls label detail <<< "$(html_result_of "${R_RC[$i]}" "${R_PLAIN[$i]}")"
-            IFS=$'\t' read -r sev_e sev_w sev_i fsev ftxt < "$HTML_WORK/meta.$idx" || { sev_e=0; sev_w=0; sev_i=0; fsev=""; ftxt=""; }
-            printf '<tr class="%s"><td><span class="pill lg %s">%s</span>%s</td>' \
-                "$([[ "$cls" == ok ]] && printf 'is-ok')" "$cls" "$label" \
-                "$([[ -n "$detail" ]] && printf '<span class="why">%s</span>' "$(html_esc_s "$detail")")"
-            printf '<td class="name"><a href="#t%s">%s</a></td><td class="method">%s</td><td>%s</td>' \
-                "$idx" "$(html_esc_s "${R_NAME[$i]}")" "$(html_esc_s "${R_METHOD[$i]}")" "$(html_esc_s "${R_MODE[$i]}")"
-            printf '<td><span class="cnt"><span class="%s"><b>%s</b> err</span><span class="%s"><b>%s</b> warn</span></span></td>' \
-                "$([[ ${sev_e:-0} -gt 0 ]] && printf e)" "${sev_e:-0}" "$([[ ${sev_w:-0} -gt 0 ]] && printf w)" "${sev_w:-0}"
-            printf '<td class="key"><span class="t">%s</span></td><td class="num">%ss</td></tr>\n' "$(html_esc_s "${ftxt:-—}")" "${R_SECS[$i]}"
-            i=$((i + 1))
-        done
-        printf '</tbody></table></div>\n'
-
-        i=0
-        while [[ $i -lt $NRUN ]]; do
-            idx="${R_IDX[$i]}"
-            IFS=$'\t' read -r cls label detail <<< "$(html_result_of "${R_RC[$i]}" "${R_PLAIN[$i]}")"
-            IFS=$'\t' read -r sev_e sev_w sev_i fsev ftxt < "$HTML_WORK/meta.$idx" || { sev_e=0; sev_w=0; }
+            IFS=$'\t' read -r sev_e sev_w sev_i fsev ndb nsb nsbok mlag mlsev nobs nobsok fsfo ftxt < "$HTML_WORK/meta.$idx" || { sev_e=0; sev_w=0; }
             [[ "$cls" == ok ]] && open="" || open=" open"
-            printf '<details class="target%s" id="t%s"%s><summary>' "$([[ "$cls" == ok ]] && printf ' is-ok')" "$idx" "$open"
-            printf '<span class="pill lg %s">%s</span><span class="tname">%s</span><span class="tm">%s · %s</span>' \
+            printf '<details class="card acc%s" id="t%s"%s><summary>' "$([[ "$cls" == ok ]] && printf ' is-ok')" "$idx" "$open"
+            printf '<span class="badge %s"><span class="dot"></span>%s</span><span class="name">%s</span><span class="muted">%s · %s</span>' \
                 "$cls" "$label" "$(html_esc_s "${R_NAME[$i]}")" "$(html_esc_s "${R_METHOD[$i]}")" "$(html_esc_s "${R_MODE[$i]}")"
-            printf '<span class="push">%s<span class="cnt"><span class="%s"><b>%s</b> err</span><span class="%s"><b>%s</b> warn</span></span><span>%ss</span></span>' \
-                "$([[ -n "$detail" ]] && printf '<span>%s</span>' "$(html_esc_s "$detail")")" \
-                "$([[ ${sev_e:-0} -gt 0 ]] && printf e)" "${sev_e:-0}" "$([[ ${sev_w:-0} -gt 0 ]] && printf w)" "${sev_w:-0}" "${R_SECS[$i]}"
-            printf '</summary>\n<div class="tbody">\n'
+            printf '<span class="right">'
+            if [[ "$cls" == fail ]]; then
+                printf '<span>%s</span>' "$(html_esc_s "$detail")"
+            elif [[ ${sev_e:-0} -gt 0 || ${sev_w:-0} -gt 0 ]]; then
+                printf '<span>%s · %s</span>' "$(html_plural "${sev_e:-0}" error)" "$(html_plural "${sev_w:-0}" warning)"
+            fi
+            printf '<span>%ss</span>%s</span></summary>\n<div class="inner">\n' "${R_SECS[$i]}" "$(html_icon down chev)"
+            [[ "$cls" == fail ]] && printf '<div class="error-box"><p>The check did not complete: %s</p></div>\n' "$(html_esc_s "$detail")"
             cat "$HTML_WORK/body.$idx"
             if [[ -s "$HTML_WORK/out.$idx" ]]; then
-                printf '<details class="rawbox"><summary>Raw output</summary><pre class="raw">'
+                printf '<details class="raw"><summary>%sRaw output</summary><pre>' "$(html_icon right)"
                 sed $'s/\033\\[[0-9;]*m//g; s/\r$//' "$HTML_WORK/out.$idx" | html_esc
                 printf '</pre></details>\n'
             else
                 printf '<pre class="msgs">(no output)</pre>\n'
             fi
             printf '</div></details>\n'
-            i=$((i + 1))
         done
+        printf '</div>\n'
 
-        printf '<footer><span>dg_fleet_check.sh · exit code %s</span><span>Config %s</span><span>Per-target timeout %ss</span></footer>\n' \
+        printf '<footer><span>Generated by dg_fleet_check.sh, exit code %s</span><span>Config %s</span><span>Per-target timeout %ss</span></footer>\n' \
             "$WORST" "$(html_esc_s "$CONFIG_FILE")" "$FLEET_TARGET_TIMEOUT"
         printf '</div>\n<script>\n'; html_js; printf '</script>\n</body>\n</html>\n'
     } > "$tmp" || { rm -f "$tmp"; return 1; }
